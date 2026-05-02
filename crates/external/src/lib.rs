@@ -135,6 +135,21 @@ impl Drop for VirtualOutput {
 }
 
 fn create_virtual_output_with_size(width: u32, height: u32) -> Result<String> {
+    if let Some(name) = find_disabled_headless_output()? {
+        info!("Reusing existing disabled headless output: {}", name);
+
+        let mode_arg = format!("{}x{}", width, height);
+        let _ = Command::new("swaymsg")
+            .args(["output", &name, "mode", &mode_arg])
+            .output();
+
+        let _ = Command::new("swaymsg")
+            .args(["output", &name, "enable"])
+            .output();
+
+        return Ok(name);
+    }
+
     let size_arg = format!("{}x{}", width, height);
     let output = Command::new("swaymsg")
         .args(["create_output", &size_arg])
@@ -162,7 +177,7 @@ fn create_virtual_output_with_size(width: u32, height: u32) -> Result<String> {
     }
 
     let outputs_json = String::from_utf8_lossy(&new_output.stdout);
-    let current_outputs: Vec<String> = parse_headless_outputs(&outputs_json);
+    let current_outputs: Vec<String> = parse_headless_outputs(&outputs_json, false);
 
     for name in &current_outputs {
         if !all_outputs_before.contains(name) {
@@ -179,6 +194,20 @@ fn create_virtual_output_with_size(width: u32, height: u32) -> Result<String> {
     ))
 }
 
+fn find_disabled_headless_output() -> Result<Option<String>> {
+    let output = Command::new("swaymsg")
+        .args(["-t", "get_outputs"])
+        .output()
+        .map_err(|e| ExternalError::CommandFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let json = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_headless_outputs(&json, true).into_iter().next())
+}
+
 fn get_headless_output_names() -> Result<Vec<String>> {
     let output = Command::new("swaymsg")
         .args(["-t", "get_outputs"])
@@ -190,21 +219,48 @@ fn get_headless_output_names() -> Result<Vec<String>> {
     }
 
     let outputs_json = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_headless_outputs(&outputs_json))
+    Ok(parse_headless_outputs(&outputs_json, false))
 }
 
-fn parse_headless_outputs(json: &str) -> Vec<String> {
+fn parse_headless_outputs(json: &str, disabled_only: bool) -> Vec<String> {
     let mut names = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut is_disabled = false;
+    let mut is_headless = false;
 
     for line in json.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("\"name\":") {
-            if let Some(rest) = trimmed.strip_prefix("\"name\":") {
-                let rest = rest.trim().trim_end_matches(',').trim_matches('"');
-                if rest.starts_with("HEADLESS-") {
-                    names.push(rest.to_string());
+        if trimmed.starts_with("Output ") && trimmed.contains("HEADLESS-") {
+            if let Some(name) = current_name.take() {
+                if is_headless && (!disabled_only || is_disabled) {
+                    names.push(name);
                 }
             }
+            if let Some(name) = trimmed
+                .split_whitespace()
+                .find(|s| s.starts_with("HEADLESS-"))
+            {
+                current_name = Some(name.to_string());
+                is_headless = true;
+                is_disabled = trimmed.contains("(disabled)");
+            } else {
+                is_headless = false;
+            }
+        } else if trimmed.starts_with("\"name\":") {
+            if let Some(rest) = trimmed.strip_prefix("\"name\":") {
+                let rest = rest.trim().trim_end_matches(',').trim_matches('"');
+                if rest.starts_with("HEADLESS-") && !is_headless {
+                    current_name = Some(rest.to_string());
+                    is_headless = true;
+                    is_disabled = false;
+                }
+            }
+        }
+    }
+
+    if let Some(name) = current_name {
+        if is_headless && (!disabled_only || is_disabled) {
+            names.push(name);
         }
     }
 

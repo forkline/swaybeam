@@ -48,7 +48,7 @@ impl TestPatternGenerator {
         for y in 0..height {
             for x in 0..width {
                 // Determine which color bar this pixel belongs to
-                let bar_index = if bar_width > 0 { x / bar_width } else { 0 };
+                let bar_index = x.checked_div(bar_width).unwrap_or(0);
 
                 // Cycle through bars over time for animation
                 let animated_bar_index = (bar_index + frame_num) % 8;
