@@ -265,12 +265,35 @@ sudo pacman -S gst-plugins-ugly
 sudo apt install gstreamer1.0-plugins-ugly
 ```
 
-### Portal not responding
-Ensure portal services are running:
+### "Portal request was cancelled by user"
+
+This means `xdg-desktop-portal-wlr` failed to start. The most common cause on Sway is that `WAYLAND_DISPLAY` is not in the systemd user environment.
+
+**Diagnose:**
 ```bash
-systemctl --user start xdg-desktop-portal.service
-systemctl --user start xdg-desktop-portal-wlr.service
+# Check if portal-wlr is running
+systemctl --user status xdg-desktop-portal-wlr
+
+# Check if WAYLAND_DISPLAY is in the systemd user environment
+systemctl --user show-environment | grep WAYLAND_DISPLAY
+
+# Check portal capabilities (should show non-zero values)
+busctl --user get-property org.freedesktop.portal.Desktop \
+  /org/freedesktop/portal/desktop \
+  org.freedesktop.portal.ScreenCast AvailableSourceTypes
 ```
+
+If `AvailableSourceTypes` is `0` or `xdg-desktop-portal-wlr` shows "unmet condition check ConditionEnvironment=WAYLAND_DISPLAY", the fix is to import the environment from your compositor config.
+
+**Fix for Sway** — add to `~/.config/sway/config`:
+```
+exec_always --no-startup-id systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+exec_always --no-startup-id systemctl --user restart xdg-desktop-portal.service xdg-desktop-portal-wlr.service
+```
+
+**Fix for other wlroots compositors** (River, Labwc, Hyprland) — add the equivalent startup commands to your compositor's config.
+
+**Common pitfall:** Do NOT put `systemctl --user import-environment WAYLAND_DISPLAY` in `.zprofile` or `.profile`. These run *before* the compositor starts, so `WAYLAND_DISPLAY` is not yet set. The import must happen from within the compositor's config.
 
 ## Architecture
 

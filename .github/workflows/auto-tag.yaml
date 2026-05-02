@@ -32,7 +32,7 @@ jobs:
       - name: Checkout repository
         with:
           token: ${{ secrets.PAT }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Get last changelog version
         id: changelog_reader
