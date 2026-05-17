@@ -33,7 +33,6 @@ parking_lot = "0.12"
 
 # PipeWire
 pipewire = "0.10"
-libspa = "0.10"
 
 # GStreamer
 gstreamer = "0.25"

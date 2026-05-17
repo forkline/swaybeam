@@ -1961,8 +1961,6 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "libc",
- "libspa",
- "pipewire",
  "rand",
  "serde",
  "thiserror",
