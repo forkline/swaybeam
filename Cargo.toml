@@ -32,8 +32,8 @@ rand = "0.8"
 parking_lot = "0.12"
 
 # PipeWire
-pipewire = "0.9"
-libspa = "0.9"
+pipewire = "0.10"
+libspa = "0.10"
 
 # GStreamer
 gstreamer = "0.25"
