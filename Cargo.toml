@@ -32,10 +32,10 @@ rand = "0.8"
 parking_lot = "0.12"
 
 # PipeWire - exact versions required to prevent cargo resolver conflict.
-# pipewire 0.10.0 depends on libspa-sys 0.10, while libspa 0.9.2 depends on libspa-sys 0.9.
-# Both link to the same native library libspa-0.2, causing a linking conflict.
+# pipewire 0.10.0 depends on libspa-sys 0.10, so libspa must also use 0.10.x
+# to avoid linking conflict with the native libspa-0.2 library.
 pipewire = "0.10.0"
-libspa = "0.9.2"
+libspa = "0.10.0"
 
 # GStreamer
 gstreamer = "0.25"
