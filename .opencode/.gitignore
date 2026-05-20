@@ -1,6 +1,5 @@
-node_modules/
-*.log
-.DS_Store
-.env
-dist/
-build/
+node_modules
+package.json
+package-lock.json
+bun.lock
+.gitignore

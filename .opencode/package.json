@@ -1,8 +1,0 @@
-{
-  "name": "@opencode-ai/swaybeam",
-  "version": "1.0.0",
-  "description": "Opencode AI configuration for swaybeam",
-  "dependencies": {
-    "@opencode-ai/plugin": "1.14.50"
-  }
-}
