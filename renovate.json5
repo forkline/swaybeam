@@ -10,6 +10,13 @@
   },
   packageRules: [
     {
+      matchPackageNames: ['pipewire', 'libspa'],
+      groupName: 'pipewire-libspa',
+      groupSlug: 'pipewire-libspa',
+      commitMessagePrefix: 'build(deps): ',
+      commitMessageTopic: 'pipewire and libspa',
+    },
+    {
       commitMessagePrefix: 'build(deps): ',
       matchPackageNames: [
         '/.*/',
