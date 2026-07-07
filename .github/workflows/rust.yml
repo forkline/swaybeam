@@ -45,8 +45,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure*
           sudo apt-get update
           sudo apt-get install -y \
             libglib2.0-dev \
@@ -76,8 +75,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure*
           sudo apt-get update
           sudo apt-get install -y \
             libglib2.0-dev \
@@ -104,8 +102,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure*
           sudo apt-get update
           sudo apt-get install -y \
             libglib2.0-dev \
@@ -132,8 +129,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure*
           sudo apt-get update
           sudo apt-get install -y \
             libglib2.0-dev \
