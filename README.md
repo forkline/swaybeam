@@ -30,10 +30,12 @@ just daemon
 | Sway/River/Labwc/Hyprland | wlroots-based Wayland compositor | `sway` / `river` / `labwc` / `hyprland` |
 | WiFi adapter with P2P | Wi-Fi Direct for Miracast | Hardware |
 | PipeWire | Audio/video handling | `pipewire wireplumber` |
-| GStreamer | H.264/H.265 encoding | `gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly` |
+| GStreamer | H.264/H.265 encoding | `gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav` |
 | NetworkManager | P2P connection management | `networkmanager` |
 | xdg-desktop-portal-wlr | Screen capture | `xdg-desktop-portal-wlr` |
 | just | Command runner (optional) | `just` |
+
+> **Nix users**: run `nix develop` for a shell with all dependencies, or `nix build .` for a fully wrapped binary.
 
 ### Optional: Hardware Video Encoding
 
@@ -79,6 +81,28 @@ sudo apt install \
 git clone https://github.com/forkline/swaybeam.git
 cd swaybeam
 just build
+```
+
+### Nix (Any Distribution)
+
+Build directly without installing system dependencies:
+
+```bash
+# Build the production binary
+nix build github:forkline/swaybeam
+
+# Run directly (no install needed)
+nix run github:forkline/swaybeam -- doctor
+
+# Or from a local checkout
+git clone https://github.com/forkline/swaybeam.git
+cd swaybeam
+nix build .
+./result/bin/swaybeam doctor
+
+# Development shell (full dev environment)
+nix develop
+# Inside the shell: just build, cargo build, etc.
 ```
 
 ## Usage

@@ -224,6 +224,63 @@ When adding dependencies:
 3. Run `cargo update` to update lock file
 4. Document why dependency is needed
 
+## Nix Flake
+
+swaybeam provides a `flake.nix` for building with Nix:
+
+```bash
+# Build (production binary)
+nix build .
+
+# Development shell (with all tools)
+nix develop
+
+# Run via nix
+nix run . -- doctor
+```
+
+### Flake Structure
+
+- `packages.default` — production binary with `wrapProgram` + `GST_PLUGIN_SYSTEM_PATH`
+- `devShells.default` — full dev environment with Rust toolchain, GStreamer, PipeWire, etc.
+- Uses `crane` for incremental Rust builds with `rust-overlay` for toolchain management.
+
+### Key Implementation Details
+
+- **`overrideVendorCargoPackage`** patches `libspa`/`pipewire` crate sources to fix bindgen macro omissions (`SPA_ID_INVALID` → `0xffffffff`, `PW_ID_ANY` → `0xffffffff`) when compiling against PipeWire 1.6.5 headers. These crates are only needed for test targets; production builds skip them via `doCheck = false` (drops `--all-targets`).
+- **`doCheck = false`** in `commonArgs` ensures `buildDepsOnly` doesn't compile dev-dependencies (test targets). The patch is retained for anyone adding a separate test derivation later.
+- **`GST_PLUGIN_SYSTEM_PATH`** includes all 7 GStreamer packages: core, base, good, bad, ugly, libav, vaapi. Every plugin element used by the pipeline (`appsrc`, `videoconvert`, `capsfilter`, `queue`, `mpegtsmux`, `udpsink`, codecs, parsers) must be covered.
+- **Crane's `overrideVendorCargoPackage`** is the correct mechanism for patching vendored dependency sources — `cargoPatches` (from nixpkgs' `buildRustPackage`) is not supported by crane.
+
+### When Adding/Updating GStreamer Elements
+
+1. Identify which gst package provides the element:
+   - `gstreamer` — `queue`, `capsfilter`, `fakesink`, `fakesrc`, `identity`
+   - `gst-plugins-base` — `appsrc`, `videoconvert`, `videoscale`, `udpsink`
+   - `gst-plugins-good` — RTP payloaders, `videotestsrc`, `wavenc`
+   - `gst-plugins-bad` — `mpegtsmux`, `h264parse`, `h265parse`, `pipewiresrc`, `svtav1enc`
+   - `gst-plugins-ugly` — `x264enc`, `x265enc`
+   - `gst-libav` — ffmpeg-based decoders/encoders
+   - `gst-vaapi` — `vah264enc`, `vah265enc`
+2. Add the package to both `gstRuntimePlugins` (for `GST_PLUGIN_SYSTEM_PATH`) and `devShell` `buildInputs`.
+3. Verify with `string result/bin/.swaybeam-wrapped | grep GST_PLUGIN_SYSTEM_PATH`.
+
+### Common Nix Tasks
+
+```bash
+# Build dependency artifacts only (fast iteration)
+nix build .#swaybeam
+
+# Rebuild from scratch
+nix build .#swaybeam --refresh
+
+# Enter development shell
+nix develop
+
+# Update flake inputs (nixpkgs, crane, etc.)
+nix flake update
+```
+
 ## H.265/HEVC Support Notes
 
 ### Current Status
