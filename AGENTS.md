@@ -241,7 +241,7 @@ nix run . -- doctor
 
 ### Flake Structure
 
-- `packages.default` — production binary with `wrapProgram` + `GST_PLUGIN_SYSTEM_PATH`
+- `packages.default` — production binary with `wrapProgram` + `GST_PLUGIN_SYSTEM_PATH_1_0`
 - `devShells.default` — full dev environment with Rust toolchain, GStreamer, PipeWire, etc.
 - Uses `crane` for incremental Rust builds with `rust-overlay` for toolchain management.
 
@@ -249,7 +249,7 @@ nix run . -- doctor
 
 - **`overrideVendorCargoPackage`** patches `libspa`/`pipewire` crate sources to fix bindgen macro omissions (`SPA_ID_INVALID` → `0xffffffff`, `PW_ID_ANY` → `0xffffffff`) when compiling against PipeWire 1.6.5 headers. These crates are only needed for test targets; production builds skip them via `doCheck = false` (drops `--all-targets`).
 - **`doCheck = false`** in `commonArgs` ensures `buildDepsOnly` doesn't compile dev-dependencies (test targets). The patch is retained for anyone adding a separate test derivation later.
-- **`GST_PLUGIN_SYSTEM_PATH`** includes all 7 GStreamer packages: core, base, good, bad, ugly, libav, vaapi. Every plugin element used by the pipeline (`appsrc`, `videoconvert`, `capsfilter`, `queue`, `mpegtsmux`, `udpsink`, codecs, parsers) must be covered.
+- **`GST_PLUGIN_SYSTEM_PATH_1_0`** (not `GST_PLUGIN_SYSTEM_PATH`) is set in `wrapProgram`. nixpkgs' `gst-inspect-1.0` wrapper reads the version-specific `_1_0` variable and appends Nix profile paths to it — if we set the generic variant, it gets shadowed. Must use `gstreamer.out` (not plain `gstreamer`) in `gstRuntimePlugins` because the default output is `bin` (no plugin `.so` files); `out` has `libgstcoreelements.so` with `capsfilter`, `queue`, `fakesink`, etc. All 7 GStreamer packages (`gstreamer.out`, `gst-plugins-base`, `-good`, `-bad`, `-ugly`, `gst-libav`, `gst-vaapi`) are included. Every plugin element used by the pipeline (`appsrc`, `videoconvert`, `capsfilter`, `queue`, `mpegtsmux`, `udpsink`, codecs, parsers) must be covered.
 - **Crane's `overrideVendorCargoPackage`** is the correct mechanism for patching vendored dependency sources — `cargoPatches` (from nixpkgs' `buildRustPackage`) is not supported by crane.
 
 ### When Adding/Updating GStreamer Elements
@@ -262,8 +262,8 @@ nix run . -- doctor
    - `gst-plugins-ugly` — `x264enc`, `x265enc`
    - `gst-libav` — ffmpeg-based decoders/encoders
    - `gst-vaapi` — `vah264enc`, `vah265enc`
-2. Add the package to both `gstRuntimePlugins` (for `GST_PLUGIN_SYSTEM_PATH`) and `devShell` `buildInputs`.
-3. Verify with `string result/bin/.swaybeam-wrapped | grep GST_PLUGIN_SYSTEM_PATH`.
+2. Add the package to both `gstRuntimePlugins` (for `GST_PLUGIN_SYSTEM_PATH_1_0`) and `devShell` `buildInputs`.
+3. Verify with `string result/bin/.swaybeam-wrapped | grep GST_PLUGIN_SYSTEM_PATH_1_0`.
 
 ### Common Nix Tasks
 

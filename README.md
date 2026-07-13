@@ -105,6 +105,8 @@ nix develop
 # Inside the shell: just build, cargo build, etc.
 ```
 
+The production binary is wrapped with `GST_PLUGIN_SYSTEM_PATH_1_0` so GStreamer finds all plugins at runtime. All pipeline elements (`appsrc`, `videoconvert`, `capsfilter`, `queue`, `mpegtsmux`, `udpsink`, codecs, parsers) are bundled.
+
 ## Usage
 
 ### Check System Readiness
@@ -115,9 +117,9 @@ swaybeam doctor
 
 Expected output when ready:
 ```
-✓ wlroots Compositor: Running under Sway/River/Labwc/Hyprland
+✓ Sway Compositor: Running under sway (wlroots-compatible)
 ✓ PipeWire: PipeWire daemon and session manager running
-✓ GStreamer: H.264 ready, H.265/4K ready
+✓ GStreamer: H.264 ready, H.265/4K ready, AV1 ready
 ✓ NetworkManager: NetworkManager daemon running
 ✓ WPA Supplicant: wpa_supplicant daemon running
 ✓ XDG Desktop Portal: xdg-desktop-portal running
@@ -241,6 +243,8 @@ gst-inspect-1.0 vah264enc
 ```
 
 If these return "No such element", hardware encoding is not available and swaybeam will fall back to software encoding.
+
+> **Nix users**: Run `nix develop` first — `gst-inspect-1.0` needs the dev shell's environment to find plugins outside the wrapped binary.
 
 ### Audio Streaming
 
