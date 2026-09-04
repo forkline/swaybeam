@@ -157,9 +157,13 @@ impl VirtualOutput {
             resolution.height()
         );
 
-        let picker_path = hyprland::install_picker_script()?;
         let portal_config_path = hyprland::xdph_config_path();
         let original_portal_config = hyprland::read_xdph_config(&portal_config_path);
+
+        let picker_path = hyprland::picker_script_path()?;
+        let fallback_binary =
+            hyprland::original_picker_binary(original_portal_config.as_deref(), &picker_path);
+        hyprland::install_picker_script(&picker_path, &fallback_binary)?;
 
         hyprland::write_xdph_config(
             &portal_config_path,
@@ -642,14 +646,25 @@ mod hyprland {
     // its stdout, and parses a line `[SELECTION]<flags>/<selection>` where
     // `<selection>` is e.g. `screen:OUTPUTNAME`. No requester identity is
     // passed to the picker, which is exactly why this must stay marker-gated
-    // and fall through to the real picker rather than always answering.
-    const PICKER_SCRIPT: &str = r#"#!/bin/bash
+    // and fall through to a real picker rather than always answering.
+    //
+    // The fallback binary is a parameter, not hardcoded to
+    // `hyprland-share-picker`: a user may already have their own
+    // `custom_picker_binary` configured (e.g. `hyprland-preview-share-picker`),
+    // and falling through to the stock picker instead would be a real,
+    // silent downgrade the one time this script's marker check *doesn't*
+    // fire for swaybeam (some other app's concurrent screen-share request).
+    fn picker_script(fallback_binary: &str) -> String {
+        format!(
+            r#"#!/bin/bash
 # Installed by swaybeam (crates/external, Hyprland backend). Do not hand-edit
 # -- swaybeam regenerates this file each time it sets up a virtual output.
 # Only answers non-interactively while swaybeam has a pending capture of its
 # own (the marker file below); every other screen-share/screenshot request
-# on this system falls through to the real picker untouched.
-marker="${XDG_RUNTIME_DIR:-/tmp}/swaybeam-portal-target"
+# on this system falls through to the picker that was configured before
+# swaybeam ran ({fallback_binary}), so an existing custom picker doesn't get
+# silently downgraded to the stock one.
+marker="${{XDG_RUNTIME_DIR:-/tmp}}/swaybeam-portal-target"
 if [[ -r $marker ]]; then
     output=$(<"$marker")
     if [[ -n $output ]]; then
@@ -657,8 +672,10 @@ if [[ -r $marker ]]; then
         exit 0
     fi
 fi
-exec hyprland-share-picker "$@"
-"#;
+exec {fallback_binary} "$@"
+"#
+        )
+    }
 
     pub(super) fn marker_path() -> PathBuf {
         let runtime_dir =
@@ -675,7 +692,7 @@ exec hyprland-share-picker "$@"
         let _ = std::fs::remove_file(path);
     }
 
-    fn picker_script_path() -> Result<PathBuf> {
+    pub(super) fn picker_script_path() -> Result<PathBuf> {
         let data_home = std::env::var("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
@@ -689,23 +706,74 @@ exec hyprland-share-picker "$@"
         Ok(dir.join(PICKER_SCRIPT_FILENAME))
     }
 
-    pub(super) fn install_picker_script() -> Result<PathBuf> {
-        let path = picker_script_path()?;
-        std::fs::write(&path, PICKER_SCRIPT)
+    /// Best-effort scan of the (pre-swaybeam) xdph.conf for an existing
+    /// `screencopy { custom_picker_binary = ... }` so our wrapper's fallback
+    /// preserves it. Not a full hyprlang parser — just enough block/brace
+    /// tracking for the shape hyprlang actually produces. Guards against the
+    /// pathological case of a prior swaybeam run's own wrapper still being
+    /// configured (e.g. after a crash that skipped cleanup): falling
+    /// through to *itself* would exec-loop forever, so that value is
+    /// rejected in favor of the real default.
+    pub(super) fn original_picker_binary(existing: Option<&str>, own_script_path: &Path) -> String {
+        const DEFAULT: &str = "hyprland-share-picker";
+        let Some(text) = existing else {
+            return DEFAULT.to_string();
+        };
+
+        let mut in_screencopy = false;
+        let mut depth: i32 = 0;
+
+        for raw_line in text.lines() {
+            let line = raw_line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if !in_screencopy && line.starts_with("screencopy") && line.contains('{') {
+                in_screencopy = true;
+                depth = 0;
+            }
+
+            if !in_screencopy {
+                continue;
+            }
+
+            depth += line.matches('{').count() as i32;
+            depth -= line.matches('}').count() as i32;
+
+            if let Some(rest) = line.strip_prefix("custom_picker_binary") {
+                if let Some(value) = rest.trim_start().strip_prefix('=') {
+                    let value = value.trim().trim_matches('"');
+                    if !value.is_empty() && Path::new(value) != own_script_path {
+                        return value.to_string();
+                    }
+                }
+            }
+
+            if depth <= 0 {
+                in_screencopy = false;
+            }
+        }
+
+        DEFAULT.to_string()
+    }
+
+    pub(super) fn install_picker_script(path: &Path, fallback_binary: &str) -> Result<()> {
+        std::fs::write(path, picker_script(fallback_binary))
             .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
+            let mut perms = std::fs::metadata(path)
                 .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?
                 .permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms)
+            std::fs::set_permissions(path, perms)
                 .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
         }
 
-        Ok(path)
+        Ok(())
     }
 
     pub(super) fn xdph_config_path() -> PathBuf {
@@ -810,6 +878,62 @@ pub fn parse_resolution_from_wfd_formats(formats: &str) -> ExternalResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn original_picker_binary_missing_file_uses_default() {
+        assert_eq!(
+            hyprland::original_picker_binary(None, Path::new("/x/swaybeam-hyprland-picker.sh")),
+            "hyprland-share-picker"
+        );
+    }
+
+    #[test]
+    fn original_picker_binary_no_screencopy_block_uses_default() {
+        let config = "general {\n    toplevel_dynamic_bind = 1\n}\n";
+        assert_eq!(
+            hyprland::original_picker_binary(
+                Some(config),
+                Path::new("/x/swaybeam-hyprland-picker.sh")
+            ),
+            "hyprland-share-picker"
+        );
+    }
+
+    #[test]
+    fn original_picker_binary_preserves_existing_custom_picker() {
+        // The exact shape observed on a live install: a pre-existing
+        // hyprland-preview-share-picker configuration. This must survive
+        // as the fallback so a Miracast session doesn't quietly downgrade
+        // the user's picker for any request that isn't swaybeam's own.
+        let config = "screencopy {\n    \
+            allow_token_by_default = true\n    \
+            custom_picker_binary = hyprland-preview-share-picker\n\
+            }\n";
+        assert_eq!(
+            hyprland::original_picker_binary(
+                Some(config),
+                Path::new("/x/swaybeam-hyprland-picker.sh")
+            ),
+            "hyprland-preview-share-picker"
+        );
+    }
+
+    #[test]
+    fn original_picker_binary_rejects_self_reference() {
+        // Guards the crash-recovery case: a prior swaybeam run's own
+        // wrapper is still configured (cleanup was skipped, e.g. by a -9).
+        // Falling through to itself would exec-loop forever.
+        let own = Path::new("/home/user/.local/share/swaybeam/swaybeam-hyprland-picker.sh");
+        let config = format!(
+            "screencopy {{\n    custom_picker_binary = {}\n}}\n",
+            own.display()
+        );
+        assert_eq!(
+            hyprland::original_picker_binary(Some(&config), own),
+            "hyprland-share-picker"
+        );
+    }
 
     #[test]
     fn test_resolution_dimensions() {
