@@ -10,6 +10,10 @@ repository.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Only used to parse `hyprctl -j` output (the Hyprland backend); the Sway
+# backend still hand-scans swaymsg's text/JSON mix rather than pull this in
+# for its own sake.
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
