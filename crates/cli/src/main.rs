@@ -302,6 +302,47 @@ async fn disconnect_command(json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Renders one JSON object per `DaemonEvent`, in the shape `crates/daemon`'s
+/// event stream is turned into on stdout for `daemon --json`. Kept separate
+/// from `crates/daemon` deliberately: the daemon crate stays protocol/format
+/// agnostic (it only knows about the typed `DaemonEvent` enum), and the CLI
+/// crate — which already depends on `serde_json` for every other
+/// subcommand's `--json` output — owns turning events into wire JSON.
+fn daemon_event_json(event: swaybeam_daemon::DaemonEvent) -> serde_json::Value {
+    use swaybeam_daemon::DaemonEvent;
+
+    match event {
+        DaemonEvent::Started => json!({"event": "started"}),
+        DaemonEvent::Discovered(sinks) => json!({
+            "event": "discovered",
+            "sinks": sinks.iter().map(sink_json).collect::<Vec<_>>(),
+        }),
+        DaemonEvent::Connected(sink) => json!({
+            "event": "connected",
+            "sink": sink_json(&sink),
+        }),
+        DaemonEvent::VirtualOutputCreated { name, width, height } => json!({
+            "event": "virtual_output_created",
+            "name": name,
+            "width": width,
+            "height": height,
+        }),
+        DaemonEvent::Negotiated => json!({"event": "negotiated"}),
+        DaemonEvent::StreamingStarted => json!({"event": "streaming_started"}),
+        DaemonEvent::StreamingStopped => json!({"event": "streaming_stopped"}),
+        DaemonEvent::ErrorOccurred(message) => json!({"event": "error", "message": message}),
+        DaemonEvent::Ended => json!({"event": "ended"}),
+    }
+}
+
+fn sink_json(sink: &swaybeam_net::Sink) -> serde_json::Value {
+    json!({
+        "name": &sink.name,
+        "address": &sink.address,
+        "ip_address": &sink.ip_address,
+    })
+}
+
 async fn daemon_command(
     sink: Option<String>,
     client_mode: bool,
@@ -309,30 +350,32 @@ async fn daemon_command(
     audio: bool,
     codec: CodecChoice,
     external: Option<ExternalResolutionChoice>,
-    _json_output: bool,
+    json_output: bool,
 ) -> Result<()> {
     use swaybeam_daemon::{Daemon, DaemonConfig};
     use swaybeam_external::ExternalResolution;
     use swaybeam_stream::VideoCodec;
 
-    println!("Starting Miracast daemon...");
-    if client_mode {
-        println!("Running in RTSP client mode (TV is Group Owner)");
-    }
-    if extend_mode {
-        println!("Running in extend mode (4K virtual output)");
-    }
-    if audio {
-        println!("Audio enabled - virtual sink will be created");
-    }
-    if let Some(ref ext) = external {
-        let resolution_str = match ext {
-            ExternalResolutionChoice::Auto => "auto",
-            ExternalResolutionChoice::FourK => "4K",
-            ExternalResolutionChoice::TenEighty => "1080p",
-            ExternalResolutionChoice::SevenTwenty => "720p",
-        };
-        println!("External monitor enabled - resolution: {}", resolution_str);
+    if !json_output {
+        println!("Starting Miracast daemon...");
+        if client_mode {
+            println!("Running in RTSP client mode (TV is Group Owner)");
+        }
+        if extend_mode {
+            println!("Running in extend mode (4K virtual output)");
+        }
+        if audio {
+            println!("Audio enabled - virtual sink will be created");
+        }
+        if let Some(ref ext) = external {
+            let resolution_str = match ext {
+                ExternalResolutionChoice::Auto => "auto",
+                ExternalResolutionChoice::FourK => "4K",
+                ExternalResolutionChoice::TenEighty => "1080p",
+                ExternalResolutionChoice::SevenTwenty => "720p",
+            };
+            println!("External monitor enabled - resolution: {}", resolution_str);
+        }
     }
 
     let video_codec = match codec {
@@ -359,8 +402,38 @@ async fn daemon_command(
     };
     let mut daemon = Daemon::with_config(config);
 
-    if let Err(e) = daemon.run().await {
-        eprintln!("Daemon error: {}", e);
+    // Subscribed before `run()` so no early event (Started, in particular)
+    // can be missed; drained on a separate task so a slow/absent reader on
+    // the other end of stdout can't backpressure the daemon's own state
+    // machine (the channel is unbounded — see crates/daemon).
+    let drain_handle = if json_output {
+        let mut rx = daemon
+            .subscribe_events()
+            .expect("subscribe_events() only returns None if called twice");
+        Some(tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let Ok(line) = serde_json::to_string(&daemon_event_json(event)) {
+                    println!("{}", line);
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let result = daemon.run().await;
+    if let Err(ref e) = result {
+        if !json_output {
+            eprintln!("Daemon error: {}", e);
+        }
+    }
+
+    // Drop the daemon (and with it the event channel's sender) before
+    // awaiting the drain task, or that task's `rx.recv()` would wait
+    // forever for a close that a still-alive sender will never send.
+    drop(daemon);
+    if let Some(handle) = drain_handle {
+        handle.await.ok();
     }
 
     Ok(())
@@ -412,5 +485,61 @@ mod tests {
 
         let cmd = Cli::try_parse_from(["swaybeam", "status"]);
         assert!(cmd.is_ok());
+    }
+
+    // Pins the wire shape omarchy-wireless-displayd parses `daemon --json`
+    // output against — a field rename here is a breaking change for that
+    // consumer, so it should fail a test, not just a changelog note.
+    #[test]
+    fn daemon_event_json_shapes() {
+        use swaybeam_daemon::DaemonEvent;
+        use swaybeam_net::Sink;
+
+        assert_eq!(
+            daemon_event_json(DaemonEvent::Started),
+            json!({"event": "started"})
+        );
+
+        assert_eq!(
+            daemon_event_json(DaemonEvent::VirtualOutputCreated {
+                name: "HEADLESS-1".to_string(),
+                width: 1920,
+                height: 1080,
+            }),
+            json!({
+                "event": "virtual_output_created",
+                "name": "HEADLESS-1",
+                "width": 1920,
+                "height": 1080,
+            })
+        );
+
+        let sink = Sink {
+            name: "Living Room TV".to_string(),
+            address: "aa:bb:cc:dd:ee:01".to_string(),
+            peer_path: None,
+            ip_address: Some("192.168.49.1".to_string()),
+            go_ip_address: None,
+            rtsp_port: 7236,
+            wfd_capabilities: None,
+        };
+        assert_eq!(
+            daemon_event_json(DaemonEvent::Connected(sink)),
+            json!({
+                "event": "connected",
+                "sink": {
+                    "name": "Living Room TV",
+                    "address": "aa:bb:cc:dd:ee:01",
+                    "ip_address": "192.168.49.1",
+                }
+            })
+        );
+
+        assert_eq!(
+            daemon_event_json(DaemonEvent::ErrorOccurred("Sink 'x' not found".to_string())),
+            json!({"event": "error", "message": "Sink 'x' not found"})
+        );
+
+        assert_eq!(daemon_event_json(DaemonEvent::Ended), json!({"event": "ended"}));
     }
 }

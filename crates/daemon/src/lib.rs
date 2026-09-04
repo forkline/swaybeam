@@ -88,6 +88,11 @@ pub enum DaemonEvent {
     Started,
     Discovered(Vec<Sink>),
     Connected(Sink),
+    /// Emitted once a headless/virtual output is created for extend mode
+    /// (or a fixed external resolution) — carries the compositor-assigned
+    /// output name (e.g. "HEADLESS-1") a caller needs to do anything with
+    /// it (place it in a layout, report it to a UI, etc.).
+    VirtualOutputCreated { name: String, width: u32, height: u32 },
     Negotiated,
     StreamingStarted,
     StreamingStopped,
@@ -152,13 +157,34 @@ impl Daemon {
         self.state.read().clone()
     }
 
+    /// Runs one full session (discover -> connect -> [virtual output] ->
+    /// negotiate -> stream -> wait for Ctrl+C -> teardown), reporting every
+    /// stage through the event channel (`subscribe_events`) as well as the
+    /// returned `Result` — a caller only watching events still sees a
+    /// terminal `ErrorOccurred` followed by `Ended` on failure, since
+    /// `run_inner`'s early-return `?`s would otherwise be invisible to
+    /// anyone not also awaiting this future directly.
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        let result = self.run_inner().await;
+        if let Err(ref e) = result {
+            self.event_tx
+                .send(DaemonEvent::ErrorOccurred(e.to_string()))
+                .ok();
+        }
+        self.event_tx.send(DaemonEvent::Ended).ok();
+        result
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
         info!("Daemon starting...");
         *self.state.write() = DaemonState::Discovering;
         self.event_tx.send(DaemonEvent::Started).ok();
 
         let sinks = self.discover().await?;
         debug!("Discovered {} sink(s)", sinks.len());
+        self.event_tx
+            .send(DaemonEvent::Discovered(sinks.clone()))
+            .ok();
 
         if sinks.is_empty() {
             return Err(anyhow::anyhow!("No Miracast sinks discovered"));
@@ -185,6 +211,13 @@ impl Daemon {
                 "Virtual output '{}' configured for 4K extend mode",
                 output.output_name()
             );
+            self.event_tx
+                .send(DaemonEvent::VirtualOutputCreated {
+                    name: output.output_name().to_string(),
+                    width: 3840,
+                    height: 2160,
+                })
+                .ok();
             self.config.video_width = 3840;
             self.config.video_height = 2160;
             self.config.video_bitrate = 20_000_000;
@@ -198,6 +231,13 @@ impl Daemon {
                 output.output_name(),
                 resolution.mode_string()
             );
+            self.event_tx
+                .send(DaemonEvent::VirtualOutputCreated {
+                    name: output.output_name().to_string(),
+                    width: resolution.width(),
+                    height: resolution.height(),
+                })
+                .ok();
             self.config.video_width = resolution.width();
             self.config.video_height = resolution.height();
             self.config.video_bitrate = if resolution == ExternalResolution::FourK {
