@@ -554,8 +554,21 @@ impl Daemon {
         );
         info!("Our P2P IP: {:?}", local_ip);
 
-        const RTSP_CONNECT_ATTEMPTS: usize = 12;
-        const RTSP_CONNECT_RETRY_DELAY_MS: u64 = 300;
+        // 20 x 500ms = 10s total budget. Previously a connection-refused on
+        // the very first attempt short-circuited straight to the reverse-
+        // listen fallback below, on the assumption that a refusal means
+        // "this GO will never accept an inbound RTSP connection." Confirmed
+        // live against a real LG TV that assumption is wrong: right after
+        // P2P group formation the TV's own screen-share session/UI needs a
+        // few seconds to actually bind its RTSP server, and a connection
+        // attempt in that window gets refused (nothing listening yet) even
+        // though the TV *will* accept one moments later. So connection-
+        // refused is now retried exactly like any other transient error --
+        // the reverse-listen fallback stays, just as what happens after
+        // every attempt in the full budget above has failed, not after the
+        // first refusal.
+        const RTSP_CONNECT_ATTEMPTS: usize = 20;
+        const RTSP_CONNECT_RETRY_DELAY_MS: u64 = 500;
 
         let mut connect_error = None;
         let mut rtsp_client = None;
@@ -566,18 +579,10 @@ impl Daemon {
                     break;
                 }
                 Err(err) => {
-                    if attempt == 1 && Self::is_connection_refused(&err) {
-                        tracing::warn!(
-                            "GO refused RTSP on {}:{}; waiting for reverse RTSP connection",
-                            go_ip,
-                            rtsp_port
-                        );
-                        return self.negotiate_as_reverse_client(&go_ip, rtsp_port).await;
-                    }
-
                     tracing::warn!(
-                        "RTSP connect attempt {} to {}:{} failed: {:?}",
+                        "RTSP connect attempt {}/{} to {}:{} failed: {:?}",
                         attempt,
+                        RTSP_CONNECT_ATTEMPTS,
                         go_ip,
                         rtsp_port,
                         err
@@ -592,14 +597,20 @@ impl Daemon {
             }
         }
 
-        let rtsp_client = rtsp_client.ok_or_else(|| {
-            anyhow::anyhow!(
-                "RTSP client connection failed to {}:{} - {:?}",
-                go_ip,
-                rtsp_port,
-                connect_error
-            )
-        })?;
+        let rtsp_client = match rtsp_client {
+            Some(client) => client,
+            None => {
+                tracing::warn!(
+                    "RTSP client connect to {}:{} did not succeed after {} attempts ({:?}); \
+                     trying a reverse RTSP connection instead",
+                    go_ip,
+                    rtsp_port,
+                    RTSP_CONNECT_ATTEMPTS,
+                    connect_error
+                );
+                return self.negotiate_as_reverse_client(&go_ip, rtsp_port).await;
+            }
+        };
 
         info!("Connected to TV's RTSP server!");
         self.negotiate_with_rtsp_client(rtsp_client).await?;
