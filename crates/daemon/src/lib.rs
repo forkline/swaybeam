@@ -405,8 +405,22 @@ impl Daemon {
             // Connect as RTSP client to the sink's RTSP server
             self.negotiate_as_client().await?;
         } else {
-            // Act as RTSP server (traditional source mode)
-            self.negotiate_as_server().await?;
+            // The sink opens the TCP connection to us -- but in WFD the
+            // *source* drives the RTSP conversation regardless of who dialled
+            // (M1 OPTIONS, M3/M4 capability exchange, M5 wfd_trigger_method:
+            // SETUP, then the sink answers with SETUP+PLAY). So this listens,
+            // then drives, via negotiate_as_reverse_client.
+            //
+            // NOT negotiate_as_server(): that path listens but is purely
+            // *reactive* -- its handle_connection() blocks on socket.read()
+            // waiting for the sink to send the first request. Confirmed live
+            // against a real LG TV with a packet capture: the TCP handshake
+            // completed, then both sides sat silent for exactly 10s (zero
+            // RTSP bytes in either direction) before the TV gave up and sent
+            // RST. No real WFD sink drives the exchange, because the spec
+            // says the source does.
+            let (go_ip, rtsp_port) = self.reverse_rtsp_target()?;
+            self.negotiate_as_reverse_client(&go_ip, rtsp_port).await?;
         }
 
         info!("RTSP negotiation completed");
@@ -655,6 +669,40 @@ impl Daemon {
         self.negotiate_with_rtsp_client(rtsp_client).await?;
 
         Ok(())
+    }
+
+    /// Peer address + RTSP port for the listen-then-drive path. Same
+    /// resolution negotiate_as_client does for its outbound dial, factored
+    /// out because the reverse path needs the peer's address too -- not to
+    /// connect to it, but to address the RTSP requests it sends over the
+    /// connection the sink opened.
+    fn reverse_rtsp_target(&self) -> anyhow::Result<(String, u16)> {
+        let conn = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No active connection to sink"))?;
+        let sink = conn.get_sink();
+
+        let go_ip = if let Some(go_ip) = &sink.go_ip_address {
+            go_ip.clone()
+        } else if let Some(our_ip) = &sink.ip_address {
+            let parts: Vec<&str> = our_ip.split('.').collect();
+            if parts.len() == 4 {
+                format!("{}.{}.{}.1", parts[0], parts[1], parts[2])
+            } else {
+                our_ip.clone()
+            }
+        } else {
+            return Err(anyhow::anyhow!("No IP address available"));
+        };
+
+        let rtsp_port = if sink.rtsp_port == 0 {
+            7236
+        } else {
+            sink.rtsp_port
+        };
+
+        Ok((go_ip, rtsp_port))
     }
 
     async fn negotiate_as_reverse_client(

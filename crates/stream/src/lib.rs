@@ -592,7 +592,7 @@ impl StreamPipelineInner {
                  ! queue name=queue-pre-payloader max-size-buffers=1 \
                  ! {} name=pay0 ssrc=1 perfect-rtptime=false timestamp-offset=0 seqnum-offset=0 \
                  ! udpsink name=udpsink host=127.0.0.1 port=5004 sync=false async=false \
-                 pipewiresrc name=videosrc fd={} target-object=xdg-desktop-portal-wlr keepalive-time=1000 always-copy=true do-timestamp=true \
+                 pipewiresrc name=videosrc fd={} path={} keepalive-time=1000 always-copy=true do-timestamp=true \
                  ! videoconvert \
                  ! {} name=enc {} \
                  ! {} name=parser config-interval=-1 \
@@ -601,6 +601,7 @@ impl StreamPipelineInner {
                  ! mux.{}",
                 config.video_codec.rtp_payloader(),
                 fd,
+                node_id,
                 config.video_codec.gstreamer_encoder(),
                 encoder_props,
                 config.video_codec.parser(),
@@ -613,7 +614,7 @@ impl StreamPipelineInner {
                  ! queue name=queue-pre-payloader max-size-buffers=1 \
                  ! {} name=pay0 ssrc=1 perfect-rtptime=false timestamp-offset=0 seqnum-offset=0 \
                  ! udpsink name=udpsink host=127.0.0.1 port=5004 sync=false async=false \
-                 pipewiresrc name=videosrc fd={} target-object=xdg-desktop-portal-wlr keepalive-time=1000 always-copy=true do-timestamp=true \
+                 pipewiresrc name=videosrc fd={} path={} keepalive-time=1000 always-copy=true do-timestamp=true \
                  ! videoconvert \
                  ! {} name=enc {} \
                  ! {} name=parser config-interval=-1 \
@@ -623,6 +624,7 @@ impl StreamPipelineInner {
                  {}",
                 config.video_codec.rtp_payloader(),
                 fd,
+                node_id,
                 config.video_codec.gstreamer_encoder(),
                 encoder_props,
                 config.video_codec.parser(),
