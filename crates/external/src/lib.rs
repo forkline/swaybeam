@@ -148,7 +148,12 @@ impl VirtualOutput {
     }
 
     fn create_hyprland(resolution: ExternalResolution) -> Result<Self> {
-        let output_name =
+        // `guard` stays armed across everything below: it owns the output
+        // (and, once each is applied, the portal override and marker) until
+        // the VirtualOutput that takes over teardown actually exists. Any
+        // `?` between here and the end unwinds all of it immediately,
+        // rather than orphaning state for some later cleanup_stale to find.
+        let (output_name, mut guard) =
             hyprland::create_virtual_output(resolution.width(), resolution.height())?;
         info!(
             "Created Hyprland headless output: {} ({}x{}, auto-placed)",
@@ -170,9 +175,11 @@ impl VirtualOutput {
             &picker_path,
             original_portal_config.as_deref(),
         )?;
+        guard.armed_portal_config(&portal_config_path);
 
         let marker_path = hyprland::marker_path();
         hyprland::write_marker(&marker_path, &output_name)?;
+        guard.armed_marker(&marker_path);
 
         info!(
             "Virtual output '{}' configured for {}x{}, portal auto-target armed",
@@ -180,6 +187,9 @@ impl VirtualOutput {
             resolution.width(),
             resolution.height()
         );
+
+        // Everything is in place and the VirtualOutput below owns teardown.
+        guard.disarm();
 
         Ok(VirtualOutput {
             backend: Backend::Hyprland,
@@ -606,9 +616,11 @@ mod hyprland {
     /// it was never written. This removes it on drop instead — by name once
     /// known, and by re-running the same diff before that — and is disarmed
     /// only when `create_virtual_output` is about to hand the output back.
-    struct NewOutputGuard {
+    pub(super) struct NewOutputGuard {
         before: HashSet<String>,
         name: Option<String>,
+        portal_config: Option<PathBuf>,
+        marker: Option<PathBuf>,
         armed: bool,
     }
 
@@ -617,6 +629,8 @@ mod hyprland {
             Self {
                 before,
                 name: None,
+                portal_config: None,
+                marker: None,
                 armed: true,
             }
         }
@@ -625,7 +639,18 @@ mod hyprland {
             self.name = Some(name.to_string());
         }
 
-        fn disarm(&mut self) {
+        /// Called once the managed block has actually been written, so a
+        /// later failure rolls the portal override back rather than
+        /// leaving it pointed at an output we're about to remove.
+        pub(super) fn armed_portal_config(&mut self, path: &Path) {
+            self.portal_config = Some(path.to_path_buf());
+        }
+
+        pub(super) fn armed_marker(&mut self, path: &Path) {
+            self.marker = Some(path.to_path_buf());
+        }
+
+        pub(super) fn disarm(&mut self) {
             self.armed = false;
         }
     }
@@ -634,6 +659,21 @@ mod hyprland {
         fn drop(&mut self) {
             if !self.armed {
                 return;
+            }
+
+            // Unwind in reverse order of application, so the portal is
+            // never left pointed at an output that's already gone.
+            if let Some(marker) = self.marker.take() {
+                remove_marker(&marker);
+            }
+
+            if let Some(config) = self.portal_config.take() {
+                warn!("Rolling back the xdph.conf override after failed setup");
+                // `None` for `original` is fine here: restore_xdph_config
+                // strips our sentinel block out of the *current* file, and
+                // only consults `original` to decide whether an
+                // emptied-out file should be deleted.
+                let _ = restore_xdph_config(&config, None);
             }
 
             // Falling back to the diff matters: the worst window is exactly
@@ -662,7 +702,16 @@ mod hyprland {
         }
     }
 
-    pub(super) fn create_virtual_output(width: u32, height: u32) -> Result<String> {
+    /// Returns the new output's name together with the guard still armed.
+    /// The caller owns teardown from here and must `disarm()` it only once
+    /// the whole VirtualOutput is successfully constructed -- several
+    /// fallible steps (picker install, xdph.conf write, marker write) still
+    /// run after this returns, and an early return in any of them used to
+    /// orphan the output.
+    pub(super) fn create_virtual_output(
+        width: u32,
+        height: u32,
+    ) -> Result<(String, NewOutputGuard)> {
         let before = monitor_names_now()?;
 
         let create = Command::new("hyprctl")
@@ -755,11 +804,8 @@ mod hyprland {
             )));
         }
 
-        // Fully set up and about to be handed back — the caller (and its
-        // VirtualOutput::cleanup/Drop) owns teardown from here.
-        guard.disarm();
-
-        Ok(name)
+        // Handed back still armed on purpose -- see the doc comment.
+        Ok((name, guard))
     }
 
     // Warn-only, like the Sway backend's disable_output: cleanup must not
@@ -768,22 +814,46 @@ mod hyprland {
     pub(super) fn remove_output(name: &str) -> Result<()> {
         let output = Command::new("hyprctl").args(["output", "remove", name]).output();
 
-        match output {
-            Ok(o) if o.status.success() => info!("Removed virtual output '{}'", name),
-            Ok(o) => warn!(
-                "Failed to remove output '{}': {}",
-                name,
-                String::from_utf8_lossy(&o.stderr)
-            ),
-            Err(e) => warn!("Failed to run hyprctl to remove output '{}': {}", name, e),
-        }
+        let removed = match output {
+            Ok(o) if o.status.success() => {
+                info!("Removed virtual output '{}'", name);
+                true
+            }
+            Ok(o) => {
+                warn!(
+                    "Failed to remove output '{}': {}",
+                    name,
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                warn!("Failed to run hyprctl to remove output '{}': {}", name, e);
+                false
+            }
+        };
 
-        // Cleared regardless of whether the removal above actually
-        // succeeded: either it's really gone, or hyprctl/the compositor
-        // itself is in a state where retrying later won't do any better,
-        // and an unremovable breadcrumb would just make cleanup_stale warn
-        // about the same output forever.
-        remove_output_breadcrumb();
+        // Only drop the breadcrumb once the output is actually gone --
+        // either we just removed it, or it isn't in the monitor list any
+        // more (someone else got there first, or the compositor restarted).
+        // Clearing it on a *failed* removal, as this used to, turned any
+        // transient hyprctl failure into a permanent leak: the output
+        // survives with nothing left on disk to tell cleanup_stale it
+        // exists. Keeping it costs one warning per later run; dropping it
+        // costs the output forever.
+        let gone = removed
+            || monitor_names_now()
+                .map(|names| !names.contains(name))
+                .unwrap_or(false);
+
+        if gone {
+            remove_output_breadcrumb();
+        } else {
+            warn!(
+                "Keeping the breadcrumb for '{}' so a later cleanup_stale can retry it",
+                name
+            );
+        }
 
         Ok(())
     }
@@ -935,7 +1005,14 @@ mod hyprland {
 # silently downgraded to the stock one.
 marker="${{XDG_RUNTIME_DIR:-/tmp}}/swaybeam-portal-target"
 if [[ -r $marker ]]; then
+    # Consume it: one marker answers exactly one portal request. Leaving it
+    # in place for the whole session would silently redirect every
+    # unrelated screen-share request (browser, OBS, any portal client) to
+    # swaybeam's output for as long as the stream ran. Removing it before
+    # answering also means a crash between here and the reply can't leave a
+    # live hijack armed.
     output=$(<"$marker")
+    rm -f "$marker"
     if [[ -n $output ]]; then
         printf '[SELECTION]allow-token/screen:%s\n' "$output"
         exit 0
@@ -1096,20 +1173,48 @@ exec {fallback_binary} "$@"
         Ok(())
     }
 
+    /// Removes swaybeam's block from xdph.conf, preserving everything else
+    /// as it stands *now*.
+    ///
+    /// Deliberately not "write back the snapshot taken at create time":
+    /// that clobbers any edit the user or a package update made to the file
+    /// while the session was running, and — when the file didn't exist
+    /// beforehand — deleted a file someone may have created since. Strip
+    /// the sentinel-delimited block from the current contents instead,
+    /// exactly as cleanup_stale() does. `original` is now only a fallback
+    /// for the case where the sentinels are missing (someone hand-edited
+    /// them away mid-session), and even then only when the current file
+    /// still looks like ours to rewrite.
     pub(super) fn restore_xdph_config(path: &PathBuf, original: Option<&str>) -> Result<()> {
-        match original {
-            Some(content) => {
-                std::fs::write(path, content)
-                    .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
+        let current = read_xdph_config(path);
+
+        match current.as_deref().and_then(strip_managed_block) {
+            Some(stripped) => {
+                if stripped.trim().is_empty() && original.is_none() {
+                    // Our block was the entire file and there was nothing
+                    // here before us — leave nothing behind.
+                    let _ = std::fs::remove_file(path);
+                } else {
+                    std::fs::write(path, stripped)
+                        .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
+                }
             }
             None => {
-                // We created this file from nothing; remove it rather than
-                // leave a picker override pointed at a now-gone output.
-                let _ = std::fs::remove_file(path);
+                // No sentinels found. Either the file is already clean
+                // (nothing to do) or someone removed the markers by hand,
+                // in which case there's no safe automatic edit to make --
+                // rewriting the stale snapshot over their file would lose
+                // whatever they changed.
+                warn!(
+                    "xdph.conf has no swaybeam block to remove; leaving it untouched \
+                     (it may have been edited during the session)"
+                );
+                return Ok(());
             }
         }
+
         restart_portal();
-        info!("Restored xdph.conf to its pre-swaybeam state");
+        info!("Removed swaybeam's block from xdph.conf");
         Ok(())
     }
 

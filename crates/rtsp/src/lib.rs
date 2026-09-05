@@ -1031,15 +1031,24 @@ impl RtspClient {
             bind_addr
         );
 
-        if peer_addr.ip().to_string() != server_ip {
+        // Trust the accepted connection's peer address over the caller's
+        // guess. `server_ip` is derived from the P2P subnet's .1 address,
+        // which is the sink only when the *sink* is group owner -- when the
+        // source is GO, .1 is us, and every address derived from it
+        // (notably PeerPlayInfo.dest_ip) points the RTP stream back at the
+        // local machine instead of the TV. The peer that just connected is
+        // the sink, by definition.
+        let peer_ip = peer_addr.ip().to_string();
+        if peer_ip != server_ip {
             tracing::warn!(
-                "Reverse RTSP peer IP {} did not match expected sink IP {}",
-                peer_addr.ip(),
+                "Reverse RTSP peer IP {} did not match expected sink IP {}; \
+                 using the peer address (the connection came from there)",
+                peer_ip,
                 server_ip
             );
         }
 
-        Self::from_stream(format!("{}:{}", server_ip, server_port), stream)
+        Self::from_stream(format!("{}:{}", peer_ip, server_port), stream)
     }
 
     fn control_uri(&self) -> String {

@@ -107,19 +107,29 @@ impl VirtualAudioSink {
             .output()
             .map_err(|e| AudioError::CommandFailed(e.to_string()))?;
 
-        if output.status.success() {
+        let unloaded = if output.status.success() {
             info!("Unloaded module {}", self.module_index);
+            true
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!("Failed to unload module {}: {}", self.module_index, stderr);
-        }
+            false
+        };
 
-        // Cleared regardless of whether the unload above actually
-        // succeeded, same reasoning as swaybeam-external's
-        // remove_output_breadcrumb: either it's really gone, or retrying
-        // later won't do any better, and a stuck breadcrumb would just
-        // make cleanup_stale warn about the same module forever.
-        remove_breadcrumb();
+        // Only drop the breadcrumb once the sink is actually gone -- either
+        // we just unloaded it, or it's no longer in pactl's sink list.
+        // Clearing it after a *failed* unload, as this used to, turned any
+        // transient pactl failure into a permanent leak: the virtual sink
+        // survives (potentially still the default output) with nothing left
+        // on disk to tell cleanup_stale about it.
+        if unloaded || !sink_exists(&self.sink_name) {
+            remove_breadcrumb();
+        } else {
+            warn!(
+                "Keeping the breadcrumb for '{}' so a later cleanup_stale can retry it",
+                self.sink_name
+            );
+        }
 
         self.cleaned_up = true;
         Ok(())
@@ -243,18 +253,47 @@ pub fn cleanup_stale() -> Result<()> {
         .args(["unload-module", &stale.module_index.to_string()])
         .output()
         .map_err(|e| AudioError::CommandFailed(e.to_string()))?;
-    if output.status.success() {
+    let unloaded = if output.status.success() {
         info!("Unloaded stale module {}", stale.module_index);
+        true
     } else {
         warn!(
             "Failed to unload stale module {} (already gone?): {}",
             stale.module_index,
             String::from_utf8_lossy(&output.stderr)
         );
-    }
+        false
+    };
 
-    remove_breadcrumb();
+    // Same rule as cleanup(): keep the breadcrumb unless the sink is
+    // genuinely gone, so a transient failure stays retryable next run
+    // rather than becoming a silent permanent leak.
+    if unloaded || !sink_exists(&stale.sink_name) {
+        remove_breadcrumb();
+    } else {
+        warn!(
+            "Keeping the breadcrumb for '{}' to retry on a later run",
+            stale.sink_name
+        );
+    }
     Ok(())
+}
+
+/// Whether a sink by this name is still known to PipeWire/PulseAudio.
+/// Used to tell "cleanup failed but the resource is gone anyway" (safe to
+/// forget) from "cleanup failed and it's still there" (must stay
+/// recoverable). A pactl failure here is treated as "can't confirm it's
+/// gone", which keeps the breadcrumb -- the conservative direction.
+fn sink_exists(sink_name: &str) -> bool {
+    Command::new("pactl")
+        .args(["list", "short", "sinks"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some(sink_name))
+        })
+        .unwrap_or(true)
 }
 
 fn get_default_sink() -> Result<Option<String>> {

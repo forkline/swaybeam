@@ -268,8 +268,18 @@ async fn test_e2e_reverse_rtsp_client_negotiation() {
     );
     rtsp_client.send_set_parameter(&source_caps).await.unwrap();
 
+    // The accepted connection's peer address wins over the `server_ip`
+    // hint passed to accept_reverse -- here 127.0.0.1 (where the fake TV
+    // actually connected from) rather than the 192.168.49.1 hint.
+    //
+    // This assertion used to expect the hint, which encoded a real bug:
+    // that hint is derived from the P2P subnet's .1 address, which is the
+    // sink only when the *sink* is group owner. When the source is GO, .1
+    // is the local machine, and every address derived from it -- including
+    // the RTP destination -- pointed the media stream back at ourselves
+    // instead of the TV.
     let setup_result = rtsp_client.send_setup(5004).await.unwrap();
-    assert_eq!(setup_result.destination_ip, "192.168.49.1");
+    assert_eq!(setup_result.destination_ip, "127.0.0.1");
     assert_eq!(setup_result.destination_rtp_port, 5006);
     assert_eq!(setup_result.session_id, "12345678");
 
