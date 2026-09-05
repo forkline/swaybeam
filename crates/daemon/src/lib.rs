@@ -1853,6 +1853,14 @@ impl Daemon {
         self.capture = Some(capture);
         *self.stream.write().await = Some(pipeline);
         *self.state.write() = DaemonState::Streaming;
+        // Same event start_stream() emits -- this path is the one every
+        // real session actually takes (both negotiate_as_client and
+        // negotiate_as_reverse_client land here), so without it an
+        // external consumer of the event stream sees the session reach
+        // "negotiated" and then nothing, forever, while media is really
+        // flowing. Caught live: the omarchy-wireless-display panel sat on
+        // "Connecting…" through a working, streaming session.
+        self.event_tx.send(DaemonEvent::StreamingStarted).ok();
         Ok(())
     }
 }
