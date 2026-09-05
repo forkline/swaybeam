@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::Command;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -37,6 +38,13 @@ impl VirtualAudioSink {
             "Created virtual sink '{}' with module index {}",
             sink_name, module_index
         );
+
+        // Best-effort: a breadcrumb write failing shouldn't fail sink
+        // creation outright, it just means cleanup_stale has nothing to
+        // recover if this process later dies before its own cleanup runs.
+        if let Err(e) = write_breadcrumb(&sink_name, module_index, previous_default.as_deref()) {
+            warn!("Failed to record virtual audio sink breadcrumb: {}", e);
+        }
 
         let sink = VirtualAudioSink {
             sink_name,
@@ -106,6 +114,13 @@ impl VirtualAudioSink {
             warn!("Failed to unload module {}: {}", self.module_index, stderr);
         }
 
+        // Cleared regardless of whether the unload above actually
+        // succeeded, same reasoning as swaybeam-external's
+        // remove_output_breadcrumb: either it's really gone, or retrying
+        // later won't do any better, and a stuck breadcrumb would just
+        // make cleanup_stale warn about the same module forever.
+        remove_breadcrumb();
+
         self.cleaned_up = true;
         Ok(())
     }
@@ -120,6 +135,126 @@ impl Drop for VirtualAudioSink {
             }
         }
     }
+}
+
+// --- stale-session recovery ---
+//
+// Breadcrumb recording the sink this process created, written the moment
+// create() succeeds and removed once cleanup() has run — so it exists on
+// disk for exactly as long as we owe this sink a cleanup, independent of
+// whether the process gets to run its own Drop before exiting (a crash, a
+// SIGKILL, a suspend that doesn't resume cleanly all skip Drop). Mirrors
+// swaybeam-external's identical breadcrumb for the Hyprland virtual output
+// — confirmed live that both leak the same way from the same kind of
+// abrupt termination (see ARCH.md in the netcast repo, "Smoke test against
+// real hardware"): the virtual sink was still the default output, module
+// still loaded, after a crashed run.
+const BREADCRUMB_FILENAME: &str = "audio-sink.state";
+
+fn state_dir() -> Result<PathBuf> {
+    let base = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .map_err(|_| AudioError::CommandFailed("Neither $XDG_STATE_HOME nor $HOME is set".into()))?;
+    let dir = base.join("swaybeam");
+    std::fs::create_dir_all(&dir).map_err(|e| AudioError::CommandFailed(e.to_string()))?;
+    Ok(dir)
+}
+
+fn breadcrumb_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join(BREADCRUMB_FILENAME))
+}
+
+// Three lines: sink_name, module_index, previous_default (blank line if
+// there wasn't one). Plain text, not JSON: this crate has no serde
+// dependency and the shape is simple enough not to need one.
+fn write_breadcrumb(sink_name: &str, module_index: u32, previous_default: Option<&str>) -> Result<()> {
+    let content = format!(
+        "{}\n{}\n{}\n",
+        sink_name,
+        module_index,
+        previous_default.unwrap_or("")
+    );
+    std::fs::write(breadcrumb_path()?, content).map_err(|e| AudioError::CommandFailed(e.to_string()))
+}
+
+fn remove_breadcrumb() {
+    if let Ok(path) = breadcrumb_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+struct StaleBreadcrumb {
+    sink_name: String,
+    module_index: u32,
+    previous_default: Option<String>,
+}
+
+fn read_breadcrumb() -> Option<StaleBreadcrumb> {
+    let path = breadcrumb_path().ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    parse_breadcrumb(&content)
+}
+
+fn parse_breadcrumb(content: &str) -> Option<StaleBreadcrumb> {
+    let mut lines = content.lines();
+    let sink_name = lines.next()?.trim();
+    if sink_name.is_empty() {
+        return None;
+    }
+    let module_index: u32 = lines.next()?.trim().parse().ok()?;
+    let previous_default = lines.next().map(str::trim).filter(|s| !s.is_empty());
+
+    Some(StaleBreadcrumb {
+        sink_name: sink_name.to_string(),
+        module_index,
+        previous_default: previous_default.map(str::to_string),
+    })
+}
+
+/// Removes a virtual sink a *previous* session created but never cleaned
+/// up. Meant to be called once, at the very start of every new session,
+/// before `VirtualAudioSink::create` — see swaybeam-external's
+/// `cleanup_stale` for the matching Hyprland-output recovery this is
+/// designed to run alongside.
+pub fn cleanup_stale() -> Result<()> {
+    let Some(stale) = read_breadcrumb() else {
+        return Ok(());
+    };
+
+    info!(
+        "Found a stale virtual audio sink '{}' from a previous session; removing it",
+        stale.sink_name
+    );
+
+    if let Some(ref previous) = stale.previous_default {
+        let output = Command::new("pactl")
+            .args(["set-default-sink", previous])
+            .output()
+            .map_err(|e| AudioError::CommandFailed(e.to_string()))?;
+        if output.status.success() {
+            info!("Restored default sink to '{}'", previous);
+        } else {
+            warn!("Failed to restore default sink to '{}'", previous);
+        }
+    }
+
+    let output = Command::new("pactl")
+        .args(["unload-module", &stale.module_index.to_string()])
+        .output()
+        .map_err(|e| AudioError::CommandFailed(e.to_string()))?;
+    if output.status.success() {
+        info!("Unloaded stale module {}", stale.module_index);
+    } else {
+        warn!(
+            "Failed to unload stale module {} (already gone?): {}",
+            stale.module_index,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    remove_breadcrumb();
+    Ok(())
 }
 
 fn get_default_sink() -> Result<Option<String>> {
@@ -171,6 +306,34 @@ fn load_null_sink(sink_name: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_breadcrumb_round_trips_with_previous_default() {
+        let stale = parse_breadcrumb("swaybeam_sink_abcd1234\n536870916\nalsa_output.pci-0000_00_1f.3.HiFi__Speaker__sink\n")
+            .expect("valid breadcrumb should parse");
+        assert_eq!(stale.sink_name, "swaybeam_sink_abcd1234");
+        assert_eq!(stale.module_index, 536870916);
+        assert_eq!(
+            stale.previous_default.as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.HiFi__Speaker__sink")
+        );
+    }
+
+    #[test]
+    fn parse_breadcrumb_handles_no_previous_default() {
+        // write_breadcrumb writes a blank third line when previous_default
+        // was None (there was no default sink to remember) -- must parse
+        // back to None, not Some("").
+        let stale = parse_breadcrumb("swaybeam_sink_abcd1234\n42\n\n").expect("should parse");
+        assert_eq!(stale.previous_default, None);
+    }
+
+    #[test]
+    fn parse_breadcrumb_rejects_garbage() {
+        assert!(parse_breadcrumb("").is_none());
+        assert!(parse_breadcrumb("sink_name_only").is_none());
+        assert!(parse_breadcrumb("sink_name\nnot-a-number\n").is_none());
+    }
 
     #[test]
     fn test_monitor_device_format() {

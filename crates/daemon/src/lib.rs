@@ -177,6 +177,26 @@ impl Daemon {
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         info!("Daemon starting...");
+
+        // Recover from a *previous* session that never reached its own
+        // graceful teardown -- a crash, a SIGKILL, a suspend that didn't
+        // resume cleanly all skip VirtualOutput/VirtualAudioSink's Drop.
+        // Confirmed live this is a real exposure: a run against a real TV
+        // died mid-retry with no graceful shutdown at all and left a
+        // headless output, an xdph.conf edit, a marker file, and the
+        // virtual audio sink (still the default output) all behind,
+        // needing manual recovery. Run before touching anything else so
+        // every session starts from a known-clean slate regardless of how
+        // the last one ended. Best-effort: a failure here shouldn't block
+        // starting a new session, it just means whatever didn't get
+        // cleaned stays around for the next attempt too.
+        if let Err(e) = swaybeam_external::cleanup_stale() {
+            tracing::warn!("Stale virtual-output cleanup failed: {}", e);
+        }
+        if let Err(e) = swaybeam_audio::cleanup_stale() {
+            tracing::warn!("Stale virtual-audio-sink cleanup failed: {}", e);
+        }
+
         *self.state.write() = DaemonState::Discovering;
         self.event_tx.send(DaemonEvent::Started).ok();
 
@@ -271,7 +291,21 @@ impl Daemon {
         }
 
         info!("Streaming active, press Ctrl+C to stop...");
-        tokio::signal::ctrl_c().await.ok();
+        // SIGTERM alongside SIGINT: `timeout`'s default signal, systemd
+        // stopping a unit, and most process managers' "please stop" all
+        // send SIGTERM, not SIGINT — previously only ctrl_c() (SIGINT) was
+        // caught, so any of those killed this process exactly like a
+        // SIGKILL would (no Drop, no stop_stream/disconnect/cleanup below).
+        // Confirmed live testing cleanup_stale (see there): `timeout`
+        // killing this process left the same headless-output/xdph.conf/
+        // audio-sink mess a real crash did. SIGKILL itself still can't be
+        // caught by design — cleanup_stale is what recovers from that one.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| anyhow::anyhow!("Failed to install SIGTERM handler: {}", e))?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("Received SIGINT, shutting down"),
+            _ = sigterm.recv() => info!("Received SIGTERM, shutting down"),
+        }
 
         self.stop_stream().await.ok();
         self.disconnect().await.ok();

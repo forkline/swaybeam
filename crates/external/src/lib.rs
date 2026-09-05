@@ -243,6 +243,27 @@ impl Drop for VirtualOutput {
     }
 }
 
+/// Recovers from a *previous* session that never reached its own graceful
+/// teardown — a crash, a SIGKILL, anything that skips Rust's Drop. Meant to
+/// be called once, at the very start of every new session (before
+/// `VirtualOutput::create`, before anything else), so a session always
+/// starts from a known-clean slate regardless of how the last one ended.
+///
+/// Confirmed live this is a real exposure, not a hypothetical one: a run
+/// against a real TV died mid-retry with no graceful shutdown at all and
+/// left a headless output, a `xdph.conf` edit, and a marker file behind,
+/// needing manual recovery (see ARCH.md in the netcast repo, "Smoke test
+/// against real hardware"). Hyprland-only for now — the Sway backend's
+/// disabled-and-parked headless outputs are meant to be found and reused
+/// (`find_disabled_headless_output`), not treated as a leak, so there's
+/// nothing there that needs recovering the same way.
+pub fn cleanup_stale() -> Result<()> {
+    match detect_compositor() {
+        Compositor::Hyprland => hyprland::cleanup_stale(),
+        Compositor::Sway | Compositor::Unknown => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Sway backend — swaymsg IPC + xdg-desktop-portal-wlr's `output_name=`
 // config trick. Unchanged from before the Hyprland backend was added,
@@ -654,6 +675,13 @@ mod hyprland {
             )));
         }
 
+        // Best-effort: a breadcrumb write failing shouldn't fail output
+        // creation outright, it just means cleanup_stale has nothing to
+        // recover if this process later dies uncleanly.
+        if let Err(e) = write_output_breadcrumb(&name) {
+            warn!("Failed to record virtual output breadcrumb: {}", e);
+        }
+
         Ok(name)
     }
 
@@ -673,6 +701,13 @@ mod hyprland {
             Err(e) => warn!("Failed to run hyprctl to remove output '{}': {}", name, e),
         }
 
+        // Cleared regardless of whether the removal above actually
+        // succeeded: either it's really gone, or hyprctl/the compositor
+        // itself is in a state where retrying later won't do any better,
+        // and an unremovable breadcrumb would just make cleanup_stale warn
+        // about the same output forever.
+        remove_output_breadcrumb();
+
         Ok(())
     }
 
@@ -680,6 +715,121 @@ mod hyprland {
 
     const PICKER_MARKER_FILENAME: &str = "swaybeam-portal-target";
     const PICKER_SCRIPT_FILENAME: &str = "swaybeam-hyprland-picker.sh";
+
+    // Sentinel lines bounding the block write_xdph_config appends. Shared
+    // between there and strip_managed_block below so a stale-recovery pass
+    // (run at the start of every new session — see cleanup_stale) can strip
+    // exactly and only our own addition out of xdph.conf without needing
+    // the in-memory `original` snapshot a crash would have lost: since
+    // write_xdph_config only ever *appends*, whatever came before the start
+    // sentinel is the user's original content, untouched, recoverable from
+    // the file alone.
+    const MANAGED_BLOCK_START: &str = "# --- swaybeam: managed block, restored on disconnect ---";
+    const MANAGED_BLOCK_END: &str = "# --- end swaybeam block ---";
+
+    // Breadcrumb recording which output we created, written the moment
+    // create_virtual_output succeeds and removed once remove_output has run
+    // — so it exists on disk for exactly as long as we owe this output a
+    // cleanup, independent of whether the process gets to run its own
+    // Drop/cleanup() before exiting. See cleanup_stale.
+    const OUTPUT_BREADCRUMB_FILENAME: &str = "hyprland-output.name";
+
+    fn state_dir() -> Result<PathBuf> {
+        let base = std::env::var("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+            .map_err(|_| {
+                ExternalError::ConfigWriteFailed(
+                    "Neither $XDG_STATE_HOME nor $HOME is set".into(),
+                )
+            })?;
+        let dir = base.join("swaybeam");
+        std::fs::create_dir_all(&dir).map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
+        Ok(dir)
+    }
+
+    fn output_breadcrumb_path() -> Result<PathBuf> {
+        Ok(state_dir()?.join(OUTPUT_BREADCRUMB_FILENAME))
+    }
+
+    fn write_output_breadcrumb(name: &str) -> Result<()> {
+        std::fs::write(output_breadcrumb_path()?, name)
+            .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))
+    }
+
+    fn remove_output_breadcrumb() {
+        if let Ok(path) = output_breadcrumb_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn read_output_breadcrumb() -> Option<String> {
+        let path = output_breadcrumb_path().ok()?;
+        let name = std::fs::read_to_string(path).ok()?;
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// Removes any state a *previous* session left behind because it never
+    /// reached its own graceful teardown (crash, SIGKILL, a suspend that
+    /// didn't resume cleanly — Rust's Drop doesn't run on any of those).
+    /// Meant to be called once, at the very start of every new session,
+    /// before touching anything else: confirmed live that this is a real
+    /// exposure, not a hypothetical one (see ARCH.md in the netcast repo,
+    /// "Smoke test against real hardware").
+    pub(super) fn cleanup_stale() -> Result<()> {
+        if let Some(name) = read_output_breadcrumb() {
+            info!("Found a stale virtual output '{}' from a previous session; removing it", name);
+            remove_output(&name)?;
+        }
+
+        let config_path = xdph_config_path();
+        if let Some(content) = read_xdph_config(&config_path) {
+            if let Some(stripped) = strip_managed_block(&content) {
+                info!("Found a stale swaybeam block in xdph.conf from a previous session; removing it");
+                std::fs::write(&config_path, stripped)
+                    .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
+                restart_portal();
+            }
+        }
+
+        let marker = marker_path();
+        if marker.exists() {
+            info!("Found a stale portal-target marker from a previous session; removing it");
+            remove_marker(&marker);
+        }
+
+        Ok(())
+    }
+
+    /// Removes exactly the sentinel-delimited block `write_xdph_config`
+    /// appends, if present — nothing else in the file is touched. Returns
+    /// `None` (not an error) when there's nothing to strip, which is the
+    /// overwhelmingly common case (a session that tore down normally).
+    pub(super) fn strip_managed_block(content: &str) -> Option<String> {
+        let start = content.find(MANAGED_BLOCK_START)?;
+        // Search from the start marker, not from 0, so a block end sentinel
+        // could never be matched before its own start.
+        let end_marker_pos = content[start..].find(MANAGED_BLOCK_END)?;
+        let mut end = start + end_marker_pos + MANAGED_BLOCK_END.len();
+        // Consume the block's own trailing newline (write_xdph_config
+        // always writes "{MANAGED_BLOCK_END}\n") rather than leave it
+        // dangling in whatever follows.
+        if content[end..].starts_with('\n') {
+            end += 1;
+        }
+
+        let mut result = content[..start].to_string();
+        // The appended block always begins with a blank separator line
+        // (write_xdph_config's leading "\n\n#...") — drop one trailing
+        // newline already in `result` so removing the block doesn't leave
+        // that blank line dangling.
+        if result.ends_with('\n') {
+            result.pop();
+        }
+        result.push_str(&content[end..]);
+        Some(result)
+    }
 
     // Contract confirmed against the installed xdg-desktop-portal-hyprland
     // binary (strings) and matching upstream source
@@ -852,12 +1002,12 @@ exec {fallback_binary} "$@"
             new_config.push('\n');
         }
         new_config.push_str(&format!(
-            "\n# --- swaybeam: managed block, restored on disconnect ---\n\
+            "\n{MANAGED_BLOCK_START}\n\
              screencopy {{\n\
              \x20\x20\x20\x20custom_picker_binary = {}\n\
              \x20\x20\x20\x20allow_token_by_default = true\n\
              }}\n\
-             # --- end swaybeam block ---\n",
+             {MANAGED_BLOCK_END}\n",
             picker_path.display()
         ));
 
@@ -921,6 +1071,47 @@ pub fn parse_resolution_from_wfd_formats(formats: &str) -> ExternalResolution {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn strip_managed_block_restores_exact_original() {
+        // The exact shape observed live: a real pre-existing config, then
+        // our block appended by write_xdph_config. Stripping it must
+        // reproduce the original byte-for-byte -- this is cleanup_stale's
+        // only source of truth when a crash has already lost the in-memory
+        // snapshot cleanup()'s normal path would otherwise use.
+        let original = "screencopy {\n    allow_token_by_default = true\n    custom_picker_binary = hyprland-preview-share-picker\n}\n";
+        let with_block = format!(
+            "{original}\n# --- swaybeam: managed block, restored on disconnect ---\n\
+             screencopy {{\n    custom_picker_binary = /home/user/.local/share/swaybeam/swaybeam-hyprland-picker.sh\n    allow_token_by_default = true\n}}\n\
+             # --- end swaybeam block ---\n"
+        );
+
+        assert_eq!(
+            hyprland::strip_managed_block(&with_block).as_deref(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn strip_managed_block_on_freshly_created_config_leaves_nothing() {
+        // The "existing == None" case in write_xdph_config: the appended
+        // block is the entire file. Stripping it should leave an empty
+        // string, not a dangling blank line.
+        let with_block = "\n# --- swaybeam: managed block, restored on disconnect ---\n\
+             screencopy {\n    custom_picker_binary = /x/swaybeam-hyprland-picker.sh\n    allow_token_by_default = true\n}\n\
+             # --- end swaybeam block ---\n";
+
+        assert_eq!(hyprland::strip_managed_block(with_block).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn strip_managed_block_absent_returns_none() {
+        // The overwhelmingly common case: a session that tore down
+        // normally, or a file swaybeam never touched at all.
+        let clean = "screencopy {\n    max_fps = 30\n}\n";
+        assert_eq!(hyprland::strip_managed_block(clean), None);
+        assert_eq!(hyprland::strip_managed_block(""), None);
+    }
 
     #[test]
     fn original_picker_binary_missing_file_uses_default() {
