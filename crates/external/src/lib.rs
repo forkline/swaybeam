@@ -177,12 +177,16 @@ impl VirtualOutput {
         )?;
         guard.armed_portal_config(&portal_config_path);
 
+        // The marker is deliberately NOT written here. It is armed by
+        // arm_portal_target(), immediately before the portal request --
+        // arming it this early leaves a window spanning the whole RTSP
+        // negotiation (tens of seconds) in which any other application's
+        // screen-share request would consume it, take our output, and leave
+        // swaybeam itself falling through to the interactive picker.
         let marker_path = hyprland::marker_path();
-        hyprland::write_marker(&marker_path, &output_name)?;
-        guard.armed_marker(&marker_path);
 
         info!(
-            "Virtual output '{}' configured for {}x{}, portal auto-target armed",
+            "Virtual output '{}' configured for {}x{}",
             output_name,
             resolution.width(),
             resolution.height()
@@ -200,6 +204,29 @@ impl VirtualOutput {
             marker_path: Some(marker_path),
             cleaned_up: false,
         })
+    }
+
+    /// Arms the portal auto-target for exactly the next screen-share
+    /// request. Call this immediately before triggering the portal, never
+    /// earlier: the marker is one-shot, so whichever request arrives first
+    /// consumes it, and any gap between arming and our own request is a
+    /// window where another application takes our output (and we get the
+    /// interactive picker instead).
+    ///
+    /// No-op on the Sway backend, which targets the output through
+    /// portal-wlr's config rather than a marker.
+    pub fn arm_portal_target(&self) -> Result<()> {
+        match (self.backend, &self.marker_path) {
+            (Backend::Hyprland, Some(marker)) => {
+                hyprland::write_marker(marker, &self.output_name)?;
+                info!(
+                    "Portal auto-target armed for '{}' (one-shot)",
+                    self.output_name
+                );
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn output_name(&self) -> &str {
@@ -251,6 +278,32 @@ impl Drop for VirtualOutput {
             }
         }
     }
+}
+
+/// Whether the process that recorded a breadcrumb is still running, and is
+/// still a swaybeam process.
+///
+/// The command check is what makes this safe against PID reuse: a recycled
+/// pid belonging to some unrelated program must not read as "our session is
+/// still alive" (which would suppress cleanup forever) nor, worse, as dead
+/// when it isn't. Linux-only, like the rest of this crate — reads /proc
+/// rather than taking a libc dependency for one call.
+pub(crate) fn owner_is_alive(pid: u32) -> bool {
+    let comm = match std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+        Ok(comm) => comm,
+        // No such process (or no permission to see it) -- not our owner.
+        Err(_) => return false,
+    };
+
+    if comm.trim().contains("swaybeam") {
+        return true;
+    }
+
+    // The `comm` field is truncated to 15 chars, so a longer binary name
+    // can hide there; fall back to the full command line.
+    std::fs::read(format!("/proc/{}/cmdline", pid))
+        .map(|raw| String::from_utf8_lossy(&raw).contains("swaybeam"))
+        .unwrap_or(false)
 }
 
 /// Recovers from a *previous* session that never reached its own graceful
@@ -620,7 +673,6 @@ mod hyprland {
         before: HashSet<String>,
         name: Option<String>,
         portal_config: Option<PathBuf>,
-        marker: Option<PathBuf>,
         armed: bool,
     }
 
@@ -630,7 +682,6 @@ mod hyprland {
                 before,
                 name: None,
                 portal_config: None,
-                marker: None,
                 armed: true,
             }
         }
@@ -646,10 +697,6 @@ mod hyprland {
             self.portal_config = Some(path.to_path_buf());
         }
 
-        pub(super) fn armed_marker(&mut self, path: &Path) {
-            self.marker = Some(path.to_path_buf());
-        }
-
         pub(super) fn disarm(&mut self) {
             self.armed = false;
         }
@@ -662,11 +709,10 @@ mod hyprland {
             }
 
             // Unwind in reverse order of application, so the portal is
-            // never left pointed at an output that's already gone.
-            if let Some(marker) = self.marker.take() {
-                remove_marker(&marker);
-            }
-
+            // never left pointed at an output that's already gone. (No
+            // marker to undo here: it is armed by arm_portal_target(),
+            // after this guard's lifetime, and removed by
+            // VirtualOutput::cleanup.)
             if let Some(config) = self.portal_config.take() {
                 warn!("Rolling back the xdph.conf override after failed setup");
                 // `None` for `original` is fine here: restore_xdph_config
@@ -899,8 +945,14 @@ mod hyprland {
         Ok(state_dir()?.join(OUTPUT_BREADCRUMB_FILENAME))
     }
 
+    // Two lines: owning pid, then output name. The pid is what makes
+    // "stale" distinguishable from "in use" -- breadcrumbs deliberately
+    // exist for the whole of a live session, so without an owner a second
+    // swaybeam starting up would read the first one's breadcrumb, conclude
+    // it was leftover, and tear down the running session's output.
     fn write_output_breadcrumb(name: &str) -> Result<()> {
-        std::fs::write(output_breadcrumb_path()?, name)
+        let content = format!("{}\n{}\n", std::process::id(), name);
+        std::fs::write(output_breadcrumb_path()?, content)
             .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))
     }
 
@@ -910,11 +962,32 @@ mod hyprland {
         }
     }
 
-    fn read_output_breadcrumb() -> Option<String> {
+    /// Returns the recorded output name, and whether the process that
+    /// created it is still running.
+    fn read_output_breadcrumb() -> Option<(String, bool)> {
         let path = output_breadcrumb_path().ok()?;
-        let name = std::fs::read_to_string(path).ok()?;
-        let name = name.trim();
-        (!name.is_empty()).then(|| name.to_string())
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut lines = content.lines();
+
+        let first = lines.next()?.trim().to_string();
+        match lines.next() {
+            // pid + name
+            Some(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                let owner_alive = first
+                    .parse::<u32>()
+                    .map(super::owner_is_alive)
+                    .unwrap_or(false);
+                Some((name.to_string(), owner_alive))
+            }
+            // Single line: a breadcrumb from before owners were recorded.
+            // It can only have come from an earlier build, so nothing is
+            // holding it -- treat it as stale.
+            None => (!first.is_empty()).then_some((first, false)),
+        }
     }
 
     /// Removes any state a *previous* session left behind because it never
@@ -925,9 +998,30 @@ mod hyprland {
     /// exposure, not a hypothetical one (see ARCH.md in the netcast repo,
     /// "Smoke test against real hardware").
     pub(super) fn cleanup_stale() -> Result<()> {
-        if let Some(name) = read_output_breadcrumb() {
-            info!("Found a stale virtual output '{}' from a previous session; removing it", name);
-            remove_output(&name)?;
+        // A breadcrumb whose owner is still running is not stale -- it's a
+        // live session's working state. Tearing that down (as this did
+        // unconditionally) meant starting a second swaybeam ripped the
+        // output out from under the first one mid-stream. Leave everything
+        // alone in that case, including the portal config and marker, which
+        // belong to that same running session.
+        match read_output_breadcrumb() {
+            Some((name, true)) => {
+                warn!(
+                    "Another swaybeam session is already running and owns virtual output \
+                     '{}' -- skipping stale-state cleanup so it isn't torn down. Expect \
+                     the two sessions to contend over the portal config.",
+                    name
+                );
+                return Ok(());
+            }
+            Some((name, false)) => {
+                info!(
+                    "Found a stale virtual output '{}' from a previous session; removing it",
+                    name
+                );
+                remove_output(&name)?;
+            }
+            None => {}
         }
 
         let config_path = xdph_config_path();

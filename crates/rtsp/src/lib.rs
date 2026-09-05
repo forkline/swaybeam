@@ -954,6 +954,30 @@ struct PeerRequestOutcome {
     idr_requested: bool,
 }
 
+/// Whether a peer that just connected can plausibly be the sink: either it
+/// is exactly the address we derived for it, or it shares that address's
+/// /24 (the P2P group's own subnet). Loopback is allowed so tests can drive
+/// this over 127.0.0.1.
+///
+/// This is a sanity check, not the security boundary -- binding the
+/// listener to the P2P address is. It catches the case where something else
+/// inside the group races the sink to the accept.
+fn peer_is_plausible_sink(peer_ip: &str, expected_ip: &str) -> bool {
+    if peer_ip == expected_ip || peer_ip == "127.0.0.1" {
+        return true;
+    }
+
+    let subnet = |ip: &str| {
+        let octets: Vec<&str> = ip.split('.').collect();
+        (octets.len() == 4).then(|| octets[..3].join("."))
+    };
+
+    match (subnet(peer_ip), subnet(expected_ip)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 impl RtspClient {
     fn from_stream(server_addr: String, stream: TcpStream) -> Result<Self, RtspError> {
         stream.set_nodelay(true).map_err(RtspError::Io)?;
@@ -1022,9 +1046,40 @@ impl RtspClient {
         let listener = TcpListener::bind(bind_addr).await?;
         tracing::info!("Waiting for reverse RTSP connection on {}", bind_addr);
 
-        let (stream, peer_addr) = tokio::time::timeout(timeout, listener.accept())
-            .await
-            .map_err(|_| RtspError::Timeout)??;
+        // Accept in a loop, rejecting anything that isn't plausibly the
+        // sink. Two layers, because trusting the peer address (necessary --
+        // see below) is only safe if we also control who can reach us:
+        //
+        //  1. The caller binds to the local P2P address, not 0.0.0.0, so
+        //     hosts on the ordinary LAN can't reach this listener at all.
+        //  2. Even within the P2P group, the peer must match the address we
+        //     expect, or at least share its /24. Without this, any host that
+        //     wins a race during the accept window would be handed the
+        //     screen stream.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (stream, peer_addr) = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(RtspError::Timeout);
+            }
+
+            let (stream, peer_addr) = tokio::time::timeout(remaining, listener.accept())
+                .await
+                .map_err(|_| RtspError::Timeout)??;
+
+            if peer_is_plausible_sink(&peer_addr.ip().to_string(), server_ip) {
+                break (stream, peer_addr);
+            }
+
+            tracing::warn!(
+                "Rejecting reverse RTSP connection from {}: not the expected sink ({}) \
+                 nor on its subnet",
+                peer_addr,
+                server_ip
+            );
+            drop(stream);
+        };
+
         tracing::info!(
             "Accepted reverse RTSP connection from {} on {}",
             peer_addr,
@@ -1037,11 +1092,11 @@ impl RtspClient {
         // source is GO, .1 is us, and every address derived from it
         // (notably PeerPlayInfo.dest_ip) points the RTP stream back at the
         // local machine instead of the TV. The peer that just connected is
-        // the sink, by definition.
+        // the sink -- now that the checks above establish it plausibly is.
         let peer_ip = peer_addr.ip().to_string();
         if peer_ip != server_ip {
-            tracing::warn!(
-                "Reverse RTSP peer IP {} did not match expected sink IP {}; \
+            tracing::info!(
+                "Reverse RTSP peer {} differs from the derived sink address {}; \
                  using the peer address (the connection came from there)",
                 peer_ip,
                 server_ip
@@ -2153,6 +2208,29 @@ async fn handle_teardown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_validation_accepts_the_sink_and_its_group() {
+        // Exactly the expected sink.
+        assert!(peer_is_plausible_sink("192.168.49.1", "192.168.49.1"));
+        // Another member of the same P2P group -- the source may be GO, in
+        // which case the sink is some other address on this subnet.
+        assert!(peer_is_plausible_sink("192.168.49.23", "192.168.49.1"));
+        // Loopback, so tests can drive accept_reverse over 127.0.0.1.
+        assert!(peer_is_plausible_sink("127.0.0.1", "192.168.49.1"));
+    }
+
+    #[test]
+    fn peer_validation_rejects_hosts_outside_the_group() {
+        // The whole point: a host on the ordinary LAN racing the TV to the
+        // accept window must not be handed the screen stream.
+        assert!(!peer_is_plausible_sink("192.168.1.119", "192.168.49.1"));
+        assert!(!peer_is_plausible_sink("10.0.0.5", "192.168.49.1"));
+        assert!(!peer_is_plausible_sink("192.168.50.1", "192.168.49.1"));
+        // Garbage in shouldn't read as a match.
+        assert!(!peer_is_plausible_sink("", "192.168.49.1"));
+        assert!(!peer_is_plausible_sink("not-an-ip", "192.168.49.1"));
+    }
 
     #[test]
     fn test_wfd_capabilities() {

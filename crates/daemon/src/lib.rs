@@ -165,7 +165,49 @@ impl Daemon {
     /// `run_inner`'s early-return `?`s would otherwise be invisible to
     /// anyone not also awaiting this future directly.
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let result = self.run_inner().await;
+        // Installed before the session starts, and raced against the whole
+        // of it -- not just the streaming wait at the end. Startup is
+        // exactly where a stop signal is most likely to land badly:
+        // discovery, connect and negotiation each sit on 10-15s timeouts,
+        // and previously a SIGTERM anywhere in there killed the process
+        // outright with the virtual output, portal override and audio sink
+        // already created and no teardown. SIGKILL still can't be caught --
+        // cleanup_stale is what recovers from that one.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| anyhow::anyhow!("Failed to install SIGTERM handler: {}", e))?;
+        let shutdown = async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        };
+        tokio::pin!(shutdown);
+
+        // Startup, cancellable. Dropping run_inner at an await point leaves
+        // whatever it built recorded on `self`, which the teardown below
+        // then unwinds.
+        let mut result = tokio::select! {
+            r = self.run_inner() => r,
+            sig = &mut shutdown => {
+                info!("Received {} during startup, shutting down", sig);
+                Ok(())
+            }
+        };
+
+        // Reached streaming: hold here until asked to stop.
+        if result.is_ok() && *self.state.read() == DaemonState::Streaming {
+            info!("Streaming active, press Ctrl+C to stop...");
+            let sig = (&mut shutdown).await;
+            info!("Received {}, shutting down", sig);
+        }
+
+        if let Err(e) = self.teardown().await {
+            warn!("Teardown reported a problem: {}", e);
+            if result.is_ok() {
+                result = Err(e);
+            }
+        }
+
         if let Err(ref e) = result {
             self.event_tx
                 .send(DaemonEvent::ErrorOccurred(e.to_string()))
@@ -173,6 +215,37 @@ impl Daemon {
         }
         self.event_tx.send(DaemonEvent::Ended).ok();
         result
+    }
+
+    /// Unwinds everything a session created, in reverse order. Safe to call
+    /// at any point in the lifecycle -- each step is skipped if that
+    /// resource was never created, so a signal during startup tears down
+    /// exactly as much as exists.
+    async fn teardown(&mut self) -> anyhow::Result<()> {
+        self.stop_stream().await.ok();
+        self.disconnect().await.ok();
+
+        if let Some(ref mut output) = self.virtual_output {
+            info!("Cleaning up virtual output...");
+            output
+                .cleanup()
+                .map_err(|e| tracing::warn!("Failed to cleanup virtual output: {}", e))
+                .ok();
+        }
+        self.virtual_output = None;
+
+        if let Some(ref mut audio_sink) = self.audio_sink {
+            info!("Cleaning up virtual audio sink...");
+            audio_sink
+                .cleanup()
+                .map_err(|e| tracing::warn!("Failed to cleanup audio sink: {}", e))
+                .ok();
+        }
+        self.audio_sink = None;
+
+        info!("Daemon stopped");
+        *self.state.write() = DaemonState::Idle;
+        Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
@@ -307,47 +380,9 @@ impl Daemon {
             self.start_stream().await?;
         }
 
-        info!("Streaming active, press Ctrl+C to stop...");
-        // SIGTERM alongside SIGINT: `timeout`'s default signal, systemd
-        // stopping a unit, and most process managers' "please stop" all
-        // send SIGTERM, not SIGINT — previously only ctrl_c() (SIGINT) was
-        // caught, so any of those killed this process exactly like a
-        // SIGKILL would (no Drop, no stop_stream/disconnect/cleanup below).
-        // Confirmed live testing cleanup_stale (see there): `timeout`
-        // killing this process left the same headless-output/xdph.conf/
-        // audio-sink mess a real crash did. SIGKILL itself still can't be
-        // caught by design — cleanup_stale is what recovers from that one.
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|e| anyhow::anyhow!("Failed to install SIGTERM handler: {}", e))?;
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => info!("Received SIGINT, shutting down"),
-            _ = sigterm.recv() => info!("Received SIGTERM, shutting down"),
-        }
-
-        self.stop_stream().await.ok();
-        self.disconnect().await.ok();
-
-        if let Some(ref mut output) = self.virtual_output {
-            info!("Cleaning up virtual output...");
-            output
-                .cleanup()
-                .map_err(|e| tracing::warn!("Failed to cleanup virtual output: {}", e))
-                .ok();
-        }
-        self.virtual_output = None;
-
-        if let Some(ref mut audio_sink) = self.audio_sink {
-            info!("Cleaning up virtual audio sink...");
-            audio_sink
-                .cleanup()
-                .map_err(|e| tracing::warn!("Failed to cleanup audio sink: {}", e))
-                .ok();
-        }
-        self.audio_sink = None;
-
-        info!("Daemon stopped");
-        *self.state.write() = DaemonState::Idle;
-
+        // Waiting for a stop signal and tearing down both live in run(),
+        // so that a signal arriving during *startup* -- before this point
+        // is ever reached -- unwinds just as cleanly.
         Ok(())
     }
 
@@ -729,7 +764,27 @@ impl Daemon {
         go_ip: &str,
         rtsp_port: u16,
     ) -> anyhow::Result<()> {
-        let bind_addr = format!("0.0.0.0:{}", rtsp_port);
+        // Bind the P2P address specifically, never 0.0.0.0: this listener
+        // hands whoever connects the screen stream, so it must not be
+        // reachable from the ordinary LAN. Falling back to 0.0.0.0 only if
+        // the local P2P address is somehow unknown, which shouldn't happen
+        // once a connection exists.
+        let local_p2p_ip = self
+            .connection
+            .as_ref()
+            .and_then(|conn| conn.get_sink().ip_address.clone());
+
+        let bind_addr = match local_p2p_ip {
+            Some(ref ip) => format!("{}:{}", ip, rtsp_port),
+            None => {
+                warn!(
+                    "Local P2P address unknown; binding reverse RTSP on all interfaces, \
+                     which is reachable from the wider network"
+                );
+                format!("0.0.0.0:{}", rtsp_port)
+            }
+        };
+
         let mut rtsp_client =
             RtspClient::accept_reverse(&bind_addr, go_ip, rtsp_port, Duration::from_secs(15))
                 .await?;
@@ -1837,6 +1892,20 @@ impl Daemon {
         };
         let mut capture = Capture::new(capture_config)?;
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Arm the portal auto-target as late as possible -- the very next
+        // statement is what triggers the portal request it answers. The
+        // marker is one-shot, so every moment it sits armed is a window in
+        // which some other application's screen-share request consumes it
+        // instead, takes this output, and leaves us at the interactive
+        // picker. Arming it at output-creation time (as this used to) left
+        // that window open across the whole RTSP negotiation.
+        if let Some(ref output) = self.virtual_output {
+            if let Err(e) = output.arm_portal_target() {
+                warn!("Failed to arm the portal auto-target: {}", e);
+            }
+        }
+
         let pw_stream = capture.start().await?;
 
         let audio_monitor = if self.config.enable_audio {

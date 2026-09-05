@@ -179,8 +179,12 @@ fn breadcrumb_path() -> Result<PathBuf> {
 // there wasn't one). Plain text, not JSON: this crate has no serde
 // dependency and the shape is simple enough not to need one.
 fn write_breadcrumb(sink_name: &str, module_index: u32, previous_default: Option<&str>) -> Result<()> {
+    // Leading pid: breadcrumbs exist for the whole of a live session, so
+    // an owner is what lets cleanup_stale tell "left over from a crash"
+    // from "in use by a running instance right now".
     let content = format!(
-        "{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n",
+        std::process::id(),
         sink_name,
         module_index,
         previous_default.unwrap_or("")
@@ -198,6 +202,9 @@ struct StaleBreadcrumb {
     sink_name: String,
     module_index: u32,
     previous_default: Option<String>,
+    /// Whether the process that wrote this is still running. When true the
+    /// sink belongs to a live session and must be left alone.
+    owner_alive: bool,
 }
 
 fn read_breadcrumb() -> Option<StaleBreadcrumb> {
@@ -208,18 +215,49 @@ fn read_breadcrumb() -> Option<StaleBreadcrumb> {
 
 fn parse_breadcrumb(content: &str) -> Option<StaleBreadcrumb> {
     let mut lines = content.lines();
-    let sink_name = lines.next()?.trim();
+
+    let first = lines.next()?.trim().to_string();
+    // A leading pid marks the current format. Without one this is a
+    // breadcrumb from an earlier build, which can only be left over, so it
+    // parses as unowned.
+    let (owner_alive, sink_name) = match first.parse::<u32>() {
+        Ok(pid) => (owner_is_alive(pid), lines.next()?.trim().to_string()),
+        Err(_) => (false, first),
+    };
+
     if sink_name.is_empty() {
         return None;
     }
+
     let module_index: u32 = lines.next()?.trim().parse().ok()?;
     let previous_default = lines.next().map(str::trim).filter(|s| !s.is_empty());
 
     Some(StaleBreadcrumb {
-        sink_name: sink_name.to_string(),
+        sink_name,
         module_index,
         previous_default: previous_default.map(str::to_string),
+        owner_alive,
     })
+}
+
+/// Whether the process that recorded a breadcrumb is still running and is
+/// still swaybeam. Mirrors swaybeam-external's check of the same name --
+/// duplicated rather than shared because these crates have no common
+/// dependency, and it is small enough not to warrant creating one. The
+/// command check guards against pid reuse.
+fn owner_is_alive(pid: u32) -> bool {
+    let comm = match std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+        Ok(comm) => comm,
+        Err(_) => return false,
+    };
+
+    if comm.trim().contains("swaybeam") {
+        return true;
+    }
+
+    std::fs::read(format!("/proc/{}/cmdline", pid))
+        .map(|raw| String::from_utf8_lossy(&raw).contains("swaybeam"))
+        .unwrap_or(false)
 }
 
 /// Removes a virtual sink a *previous* session created but never cleaned
@@ -231,6 +269,18 @@ pub fn cleanup_stale() -> Result<()> {
     let Some(stale) = read_breadcrumb() else {
         return Ok(());
     };
+
+    // Owned by a still-running instance: this is a live session's sink, not
+    // leftovers. Unloading it here would rip the audio out from under that
+    // session (and reset its default sink) mid-stream.
+    if stale.owner_alive {
+        warn!(
+            "Another swaybeam session is already running and owns virtual audio sink \
+             '{}' -- leaving it alone",
+            stale.sink_name
+        );
+        return Ok(());
+    }
 
     info!(
         "Found a stale virtual audio sink '{}' from a previous session; removing it",
@@ -365,6 +415,39 @@ mod tests {
         // back to None, not Some("").
         let stale = parse_breadcrumb("swaybeam_sink_abcd1234\n42\n\n").expect("should parse");
         assert_eq!(stale.previous_default, None);
+    }
+
+    #[test]
+    fn parse_breadcrumb_marks_a_live_owner() {
+        // This test process is itself a "swaybeam" binary by name, so its
+        // own pid is exactly the case that must read as alive -- the one
+        // that makes cleanup_stale leave a running session's sink alone.
+        let content = format!(
+            "{}\nswaybeam_sink_abcd1234\n42\nalsa_output.real\n",
+            std::process::id()
+        );
+        let stale = parse_breadcrumb(&content).expect("should parse");
+        assert!(stale.owner_alive, "own pid should read as a live owner");
+        assert_eq!(stale.sink_name, "swaybeam_sink_abcd1234");
+        assert_eq!(stale.module_index, 42);
+        assert_eq!(stale.previous_default.as_deref(), Some("alsa_output.real"));
+    }
+
+    #[test]
+    fn parse_breadcrumb_marks_a_dead_owner() {
+        // u32::MAX is above any real pid, so it can't be running.
+        let content = format!("{}\nswaybeam_sink_abcd1234\n42\n\n", u32::MAX);
+        let stale = parse_breadcrumb(&content).expect("should parse");
+        assert!(!stale.owner_alive, "nonexistent pid must read as dead");
+    }
+
+    #[test]
+    fn parse_breadcrumb_treats_pre_owner_format_as_unowned() {
+        // Written by a build before owners existed, so nothing holds it.
+        let stale = parse_breadcrumb("swaybeam_sink_abcd1234\n42\n\n").expect("should parse");
+        assert!(!stale.owner_alive);
+        assert_eq!(stale.sink_name, "swaybeam_sink_abcd1234");
+        assert_eq!(stale.module_index, 42);
     }
 
     #[test]
