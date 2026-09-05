@@ -10,14 +10,18 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "swaybeam")]
 #[command(about = "Miracast source for wlroots-based compositors")]
 struct Cli {
-    #[arg(long)]
+    /// `global = true` so this is accepted both before and after the
+    /// subcommand: `swaybeam --json daemon` and `swaybeam daemon --json`
+    /// both work. Without it clap only accepts the former, while this
+    /// project's own docs and commit messages use the latter.
+    #[arg(long, global = true)]
     json: bool,
 
     /// Wi-Fi interface to run P2P/Wi-Fi Direct discovery and connections on.
     /// "wlan0" is the old kernel-numbered naming; most current systems
     /// (predictable network interface naming) use something like
     /// "wlp0s20f3" instead -- check `iw dev` if discovery finds nothing.
-    #[arg(long, default_value = "wlan0")]
+    #[arg(long, global = true, default_value = "wlan0")]
     interface: String,
 
     #[command(subcommand)]
@@ -89,11 +93,20 @@ struct SinkRow {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    // Parse before installing the subscriber, because where tracing writes
+    // depends on the mode: tracing_subscriber's default writer is *stdout*,
+    // which in --json mode interleaves formatted log lines with the NDJSON
+    // event stream the moment RUST_LOG is set or any error event fires --
+    // and a consumer parsing stdout line-by-line as JSON chokes on them.
+    // stdout stays machine-only; diagnostics go to stderr.
+    let subscriber = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    if cli.json {
+        subscriber.with_writer(std::io::stderr).init();
+    } else {
+        subscriber.init();
+    }
 
     match &cli.command {
         Command::Doctor => doctor_command(cli.json).await,

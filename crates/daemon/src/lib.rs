@@ -441,7 +441,9 @@ impl Daemon {
         }
 
         info!("RTSP negotiation completed");
-        self.event_tx.send(DaemonEvent::Negotiated).ok();
+        // DaemonEvent::Negotiated is emitted from start_negotiated_stream(),
+        // not here -- see the comment there. Emitting it at this point put
+        // it *after* StreamingStarted in the event stream.
 
         Ok(())
     }
@@ -1792,6 +1794,16 @@ impl Daemon {
         destination_ip: &str,
         destination_rtp_port: u16,
     ) -> anyhow::Result<()> {
+        // Negotiation is, by definition, complete once we're starting the
+        // negotiated stream -- and emitting it here rather than back in
+        // negotiate() is what keeps the event stream in lifecycle order.
+        // negotiate_as_{client,reverse_client,server} each do the RTSP
+        // exchange *and* start the stream, so negotiate()'s post-return
+        // emission landed *after* StreamingStarted below, and a consumer
+        // tracking status would flip streaming -> connecting. Both events
+        // now come from this one place, in the right order.
+        self.event_tx.send(DaemonEvent::Negotiated).ok();
+
         // Must match what run_inner() sized the virtual output to for
         // extend mode, and what the sink can actually decode -- see the
         // 1080p rationale there.

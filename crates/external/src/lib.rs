@@ -596,6 +596,72 @@ mod hyprland {
     /// the existing omarchy-hyprland-monitor-* scripts (which only tolerate
     /// *transient* user-created headless outputs) would have to reason
     /// about it.
+    /// Owns a freshly created headless output until creation *fully*
+    /// succeeds. `hyprctl output create headless` hands us an output before
+    /// we know its name — that takes a follow-up diff — and several fallible
+    /// steps run between that point and the breadcrumb write: monitor
+    /// discovery, the mode-set, the applied-resolution check. An early
+    /// return anywhere in that window used to leak an output that
+    /// `cleanup_stale()` could never identify, because the breadcrumb naming
+    /// it was never written. This removes it on drop instead — by name once
+    /// known, and by re-running the same diff before that — and is disarmed
+    /// only when `create_virtual_output` is about to hand the output back.
+    struct NewOutputGuard {
+        before: HashSet<String>,
+        name: Option<String>,
+        armed: bool,
+    }
+
+    impl NewOutputGuard {
+        fn new(before: HashSet<String>) -> Self {
+            Self {
+                before,
+                name: None,
+                armed: true,
+            }
+        }
+
+        fn set_name(&mut self, name: &str) {
+            self.name = Some(name.to_string());
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for NewOutputGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+
+            // Falling back to the diff matters: the worst window is exactly
+            // the one where the name was never resolved, since without it
+            // nothing else — not the breadcrumb, not cleanup_stale — can
+            // identify what to remove.
+            let name = self.name.clone().or_else(|| {
+                monitor_names_now()
+                    .ok()
+                    .and_then(|after| after.difference(&self.before).next().cloned())
+            });
+
+            match name {
+                Some(name) => {
+                    warn!(
+                        "Virtual output setup failed after '{}' was created; removing it",
+                        name
+                    );
+                    let _ = remove_output(&name);
+                }
+                None => warn!(
+                    "Virtual output setup failed and the new output could not be identified \
+                     for removal — it may linger until the next cleanup_stale()"
+                ),
+            }
+        }
+    }
+
     pub(super) fn create_virtual_output(width: u32, height: u32) -> Result<String> {
         let before = monitor_names_now()?;
 
@@ -605,10 +671,14 @@ mod hyprland {
             .map_err(|e| ExternalError::CommandFailed(e.to_string()))?;
 
         if !create.status.success() {
+            // Nothing was created, so nothing to guard.
             return Err(ExternalError::CreateFailed(
                 String::from_utf8_lossy(&create.stderr).into_owned(),
             ));
         }
+
+        // From here on an output exists, so everything below is guarded.
+        let mut guard = NewOutputGuard::new(before.clone());
 
         // hyprctl's IPC call is synchronous, but give the compositor a
         // couple of short retries before giving up — cheap insurance
@@ -628,6 +698,16 @@ mod hyprland {
         let name = new_name.ok_or_else(|| {
             ExternalError::CreateFailed("Could not determine new headless output name".into())
         })?;
+        guard.set_name(&name);
+
+        // Written as soon as the name is known rather than at the end, so
+        // the window where an output exists with no breadcrumb naming it is
+        // as small as possible. Best-effort: a breadcrumb write failing
+        // shouldn't fail output creation, it just means cleanup_stale has
+        // nothing to recover from if this process later dies uncleanly.
+        if let Err(e) = write_output_breadcrumb(&name) {
+            warn!("Failed to record virtual output breadcrumb: {}", e);
+        }
 
         // `hyprctl keyword monitor ...` is the pre-0.55 hyprlang syntax and
         // is dead on this and every current Hyprland version: since the
@@ -675,12 +755,9 @@ mod hyprland {
             )));
         }
 
-        // Best-effort: a breadcrumb write failing shouldn't fail output
-        // creation outright, it just means cleanup_stale has nothing to
-        // recover if this process later dies uncleanly.
-        if let Err(e) = write_output_breadcrumb(&name) {
-            warn!("Failed to record virtual output breadcrumb: {}", e);
-        }
+        // Fully set up and about to be handed back — the caller (and its
+        // VirtualOutput::cleanup/Drop) owns teardown from here.
+        guard.disarm();
 
         Ok(name)
     }
