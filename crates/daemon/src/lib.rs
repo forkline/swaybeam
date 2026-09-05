@@ -462,19 +462,28 @@ impl Daemon {
                 );
             }
 
-            // In Wi-Fi Direct, sometimes the device type information indicates role
-            // but detection logic can be complex. A common situation is that TVs
-            // can operate in GO role despite being sinks conceptually.
-            // Try heuristics, or just return a reasonable default
+            // The P2P layer (crates/net) already resolves the group owner's
+            // address as part of connecting (Sink::go_ip_address) -- if it
+            // differs from our own address, the peer is the GO, and per WFD
+            // convention a GO sink runs its own RTSP server and expects the
+            // source to connect to it as a client. Confirmed live against a
+            // real LG TV (GO at 192.168.49.1, us at 192.168.49.10): without
+            // this check, the daemon opened an RTSP server nobody was ever
+            // going to connect to and timed out waiting 15s for a PLAY that
+            // could never arrive.
+            if let (Some(go_ip), Some(our_ip)) = (&sink.go_ip_address, &sink.ip_address) {
+                if go_ip != our_ip {
+                    info!(
+                        "Sink's P2P group owner ({}) differs from our address ({}) -- \
+                         sink is the GO, negotiating as RTSP client",
+                        go_ip, our_ip
+                    );
+                    return Ok(true);
+                }
+            }
 
-            // For now, just use force mechanism, or fallback to default
-            // A sophisticated detection could check:
-            // 1. Network address patterns (TV often ends in .1 or .254)
-            // 2. MAC OUI patterns
-            // 3. Known device type patterns
-            // 4. Test for RTSP server availability
-
-            Ok(false) // Default to traditional mode unless explicitly forced
+            info!("No evidence the sink is the P2P group owner; negotiating as traditional RTSP server");
+            Ok(false)
         } else {
             // No connection - default to server mode
             Ok(false)
