@@ -10,17 +10,19 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "swaybeam")]
 #[command(about = "Miracast source for wlroots-based compositors")]
 struct Cli {
-    /// `global = true` so this is accepted both before and after the
-    /// subcommand: `swaybeam --json daemon` and `swaybeam daemon --json`
-    /// both work. Without it clap only accepts the former, while this
-    /// project's own docs and commit messages use the latter.
+    /// Emit machine-readable output: one JSON object per line on stdout,
+    /// with logs routed to stderr so stdout stays parseable.
+    // `global = true` so this is accepted both before and after the
+    // subcommand -- `swaybeam --json daemon` and `swaybeam daemon --json`
+    // both work. Without it clap only accepts the former, while this
+    // project's own docs and commit messages use the latter.
     #[arg(long, global = true)]
     json: bool,
 
-    /// Wi-Fi interface to run P2P/Wi-Fi Direct discovery and connections on.
-    /// "wlan0" is the old kernel-numbered naming; most current systems
-    /// (predictable network interface naming) use something like
-    /// "wlp0s20f3" instead -- check `iw dev` if discovery finds nothing.
+    /// Wi-Fi interface for P2P/Wi-Fi Direct discovery and connections. If
+    /// discovery finds nothing, check `iw dev` -- the "wlan0" default is
+    /// the old kernel-numbered naming, and most current systems use
+    /// predictable names like "wlp0s20f3" instead.
     #[arg(long, global = true, default_value = "wlan0")]
     interface: String,
 
@@ -71,12 +73,21 @@ enum Command {
         sink: Option<String>,
         #[arg(short, long)]
         client: bool,
+        /// Extend the desktop onto the sink via a 1080p virtual output,
+        /// rather than mirroring an existing one. Not 4K: classic
+        /// Miracast/WFD tops out at 1920x1080 (see --external).
         #[arg(long)]
         extend: bool,
         #[arg(long)]
         audio: bool,
         #[arg(long, value_enum, default_value = "auto")]
         codec: CodecChoice,
+        /// Virtual output size for a fixed external resolution. Note that
+        /// `4k` is almost never negotiable: the CEA/VESA/HH resolution
+        /// bitmaps sinks advertise in wfd_video_formats have no 4K entries
+        /// at all (that needs WFD 2.0), so a 4K-capable TV will still
+        /// typically cap at 1920x1080 and silently fail to decode anything
+        /// larger.
         #[arg(long, value_enum)]
         external: Option<ExternalResolutionChoice>,
     },
@@ -387,7 +398,7 @@ async fn daemon_command(
             println!("Running in RTSP client mode (TV is Group Owner)");
         }
         if extend_mode {
-            println!("Running in extend mode (4K virtual output)");
+            println!("Running in extend mode (1080p virtual output)");
         }
         if audio {
             println!("Audio enabled - virtual sink will be created");
