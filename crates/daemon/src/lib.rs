@@ -496,27 +496,32 @@ impl Daemon {
                 );
             }
 
-            // The P2P layer (crates/net) already resolves the group owner's
-            // address as part of connecting (Sink::go_ip_address) -- if it
-            // differs from our own address, the peer is the GO, and per WFD
-            // convention a GO sink runs its own RTSP server and expects the
-            // source to connect to it as a client. Confirmed live against a
-            // real LG TV (GO at 192.168.49.1, us at 192.168.49.10): without
-            // this check, the daemon opened an RTSP server nobody was ever
-            // going to connect to and timed out waiting 15s for a PLAY that
-            // could never arrive.
-            if let (Some(go_ip), Some(our_ip)) = (&sink.go_ip_address, &sink.ip_address) {
-                if go_ip != our_ip {
-                    info!(
-                        "Sink's P2P group owner ({}) differs from our address ({}) -- \
-                         sink is the GO, negotiating as RTSP client",
-                        go_ip, our_ip
-                    );
-                    return Ok(true);
-                }
+            // A previous version of this function used exactly this
+            // signal -- Sink::go_ip_address differing from our own
+            // address, meaning the peer is the P2P group owner -- to infer
+            // "GO sink runs its own RTSP server, negotiate as client",
+            // reasoning from the WFD spec's nominal role assignment.
+            // Packet capture against a real LG TV (as GO) proved that
+            // reasoning wrong for real hardware: the TV repeatedly SYNs
+            // *our* port 7236 (as a client, from the moment the P2P group
+            // forms) while nothing we send it ever gets more than an
+            // immediate RST -- it wants the traditional roles (source =
+            // RTSP server) regardless of which side is the P2P GO. Worse,
+            // guessing client mode first burns most of the TV's own ~8-10s
+            // patience window dialing a connection nobody answers, so by
+            // the time this would fall back to server mode the TV has
+            // already torn down the P2P group. GO status is not a reliable
+            // signal for RTSP role -- default to server mode unless a user
+            // explicitly knows their sink needs `--client`.
+            if let Some(ref go_ip) = sink.go_ip_address {
+                debug!(
+                    "Sink's P2P group owner is {} (informational only -- not used to infer \
+                     RTSP role, see comment above)",
+                    go_ip
+                );
             }
 
-            info!("No evidence the sink is the P2P group owner; negotiating as traditional RTSP server");
+            info!("Negotiating as traditional RTSP server (pass --client if this sink needs the reverse role)");
             Ok(false)
         } else {
             // No connection - default to server mode
