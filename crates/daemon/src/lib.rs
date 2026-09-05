@@ -224,23 +224,40 @@ impl Daemon {
         self.connect(sink).await?;
 
         if self.config.extend_mode {
-            let output =
-                tokio::task::block_in_place(|| VirtualOutput::create(ExternalResolution::FourK))
-                    .map_err(|e| anyhow::anyhow!("Failed to create virtual output: {}", e))?;
+            // 1080p, not 4K. Classic Miracast/WFD tops out at 1920x1080:
+            // the CEA/VESA/HH resolution bitmaps a sink advertises in
+            // wfd_video_formats have no 4K entries at all (that needs WFD
+            // 2.0 extensions). Confirmed live against a real LG B9 OLED --
+            // a 4K-capable TV, which still advertised
+            // CEA=0x000194FF (max 1920x1080p30) -- where sending 3840x2160
+            // produced a steady RTP flow the TV simply could not decode:
+            // spinner on screen, no picture, while Hyprland happily showed
+            // the extended output on our side.
+            //
+            // Fixed size rather than derived from the sink's advertised
+            // formats because the virtual output has to exist *before* the
+            // RTSP capability exchange that reveals them; deriving it
+            // properly means reordering those two phases (see
+            // parse_resolution_from_wfd_formats, which already decodes the
+            // bitmaps and is what that refactor should feed from).
+            let output = tokio::task::block_in_place(|| {
+                VirtualOutput::create(ExternalResolution::TenEighty)
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to create virtual output: {}", e))?;
             info!(
-                "Virtual output '{}' configured for 4K extend mode",
+                "Virtual output '{}' configured for 1080p extend mode",
                 output.output_name()
             );
             self.event_tx
                 .send(DaemonEvent::VirtualOutputCreated {
                     name: output.output_name().to_string(),
-                    width: 3840,
-                    height: 2160,
+                    width: 1920,
+                    height: 1080,
                 })
                 .ok();
-            self.config.video_width = 3840;
-            self.config.video_height = 2160;
-            self.config.video_bitrate = 20_000_000;
+            self.config.video_width = 1920;
+            self.config.video_height = 1080;
+            self.config.video_bitrate = 10_000_000;
             self.config.video_framerate = 30;
             self.virtual_output = Some(output);
         } else if let Some(resolution) = self.config.external_resolution {
@@ -1775,8 +1792,11 @@ impl Daemon {
         destination_ip: &str,
         destination_rtp_port: u16,
     ) -> anyhow::Result<()> {
+        // Must match what run_inner() sized the virtual output to for
+        // extend mode, and what the sink can actually decode -- see the
+        // 1080p rationale there.
         let (width, height, bitrate) = if self.config.extend_mode {
-            (3840, 2160, 20_000_000u32)
+            (1920, 1080, 10_000_000u32)
         } else {
             (
                 self.config.video_width,
