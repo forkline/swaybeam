@@ -554,6 +554,18 @@ mod hyprland {
         Ok(monitor_names(&hyprctl_json(&["monitors", "all", "-j"])?))
     }
 
+    fn monitor_dims(json: &serde_json::Value, name: &str) -> Option<(u32, u32)> {
+        json.as_array()?.iter().find_map(|m| {
+            if m.get("name")?.as_str()? != name {
+                return None;
+            }
+            Some((
+                m.get("width")?.as_u64()? as u32,
+                m.get("height")?.as_u64()? as u32,
+            ))
+        })
+    }
+
     /// Create a headless output and size/place it. Unlike the Sway backend,
     /// this doesn't try to find and reuse a previously-disabled headless
     /// output — `hyprctl output remove` on cleanup fully destroys it, so
@@ -596,20 +608,50 @@ mod hyprland {
             ExternalError::CreateFailed("Could not determine new headless output name".into())
         })?;
 
-        // "auto" lets Hyprland place it beside existing outputs instead of
-        // hardcoding an offset that assumes a specific primary-monitor
-        // width (the Sway backend's `pos 1920 0` does that, and is wrong on
-        // any primary output that isn't exactly 1920 wide).
-        let mode = format!("{},{}x{}@60,auto,1", name, width, height);
+        // `hyprctl keyword monitor ...` is the pre-0.55 hyprlang syntax and
+        // is dead on this and every current Hyprland version: since the
+        // Lua-ified config (Hyprland 0.55+), it prints "keyword can't work
+        // with non-legacy parsers. Use eval." to stdout but still EXITS 0 --
+        // confirmed live, the first attempt against a real sink silently
+        // left the output at Hyprland's default 1920x1080 instead of the
+        // requested resolution, with no error anywhere. `hl.monitor{}` via
+        // `hyprctl eval` is the current API (same one omarchy's own
+        // first-party Display panel needs for its monitor toggle, per
+        // basecamp/omarchy#6968 -- this isn't swaybeam-specific fallout,
+        // it's this Hyprland version's config migration).
+        //
+        // "auto" for position lets Hyprland place it beside existing
+        // outputs instead of hardcoding an offset that assumes a specific
+        // primary-monitor width (the Sway backend's `pos 1920 0` does that,
+        // and is wrong on any primary output that isn't exactly 1920 wide).
+        let lua = format!(
+            "hl.monitor({{output = \"{name}\", mode = \"{width}x{height}@60\", position = \"auto\", scale = 1}})"
+        );
         let set_mode = Command::new("hyprctl")
-            .args(["keyword", "monitor", &mode])
+            .args(["eval", &lua])
             .output()
             .map_err(|e| ExternalError::CommandFailed(e.to_string()))?;
 
         if !set_mode.status.success() {
-            return Err(ExternalError::PositionFailed(
-                String::from_utf8_lossy(&set_mode.stderr).into_owned(),
-            ));
+            return Err(ExternalError::PositionFailed(format!(
+                "{}{}",
+                String::from_utf8_lossy(&set_mode.stdout),
+                String::from_utf8_lossy(&set_mode.stderr)
+            )));
+        }
+
+        // Belt and braces: `hyprctl eval` exits 0 even when `hl.monitor`
+        // silently no-ops (confirmed live: pointing it at a nonexistent
+        // output name is accepted without error). A clean exit status alone
+        // doesn't mean the resolution actually landed, so check the one
+        // thing that would have masked exactly the `keyword`-era bug above
+        // from being caught here too.
+        let applied = monitor_dims(&hyprctl_json(&["monitors", "all", "-j"])?, &name);
+        if applied != Some((width, height)) {
+            return Err(ExternalError::PositionFailed(format!(
+                "hyprctl eval reported success but '{name}' is at {:?} instead of the requested {}x{}",
+                applied, width, height
+            )));
         }
 
         Ok(name)
