@@ -32,7 +32,8 @@ just daemon
 | PipeWire | Audio/video handling | `pipewire wireplumber` |
 | GStreamer | H.264/H.265 encoding | `gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav` |
 | NetworkManager | P2P connection management | `networkmanager` |
-| xdg-desktop-portal-wlr | Screen capture | `xdg-desktop-portal-wlr` |
+| xdg-desktop-portal-wlr | Screen capture (Sway/River/Labwc) | `xdg-desktop-portal-wlr` |
+| xdg-desktop-portal-hyprland | Screen capture (Hyprland) | `xdg-desktop-portal-hyprland` |
 | just | Command runner (optional) | `just` |
 
 > **Nix users**: run `nix develop` for a shell with all dependencies, or `nix build .` for a fully wrapped binary.
@@ -143,12 +144,43 @@ swaybeam connect --sink "Living Room TV"
 # 1080p (default)
 swaybeam stream
 
-# 4K at 30fps
-swaybeam stream --width 3840 --height 2160 --framerate 30
-
-# 4K at 60fps
-swaybeam stream --width 3840 --height 2160 --framerate 60
+# Ask for something smaller
+swaybeam stream --width 1280 --height 720 --framerate 30
 ```
+
+**Resolution is negotiated, not chosen.** Classic Miracast/WFD has no 4K
+entries in its resolution tables at all -- the CEA/VESA/HH bitmaps a sink
+advertises top out at 1920x1080 -- so a request above what the sink offers is
+capped to its best mode. A real 4K TV (LG OLED55B9PLA) advertises
+`CEA=0x000194FF`, whose highest progressive entry is 1920x1080p30.
+
+Whatever mode is agreed is what the pipeline produces: the source commits to a
+single mode in the RTSP M4 exchange and scales to it, rather than announcing
+one geometry and sending another.
+
+### Extend the Desktop Instead of Mirroring
+
+```bash
+swaybeam daemon --sink <MAC> --extend
+```
+
+`--extend` creates a headless output and streams *that*, so the compositor
+gains a second monitor you can drag windows onto rather than duplicating the
+built-in screen. On Hyprland the output is created with `hyprctl output create
+headless` and configured through `hyprctl eval 'hl.monitor{...}'`; the Sway
+backend uses its own equivalents.
+
+Two things are worth knowing about this mode:
+
+- **The portal has to pick the right output.** swaybeam installs a one-shot
+  picker override in `~/.config/hypr/xdph.conf` so its own capture request
+  selects the headless output without a dialog, then removes it. The override
+  is armed for exactly one request.
+- **An idle virtual output produces no frames.** wlroots compositors emit a
+  screencopy frame only when an output is damaged, and a newly created output
+  with nothing on it never is. swaybeam nudges the compositor to repaint once
+  streaming starts, and repeats the most recent frame in the pipeline so the
+  sink keeps receiving a stream when the desktop is still.
 
 ### Disconnect
 
@@ -188,25 +220,21 @@ swaybeam supports multiple video codecs with both software and hardware encoding
 
 ### Supported Codecs
 
-| Codec | Encoder | Type | CPU Usage | Quality |
-|-------|---------|------|-----------|---------|
-| H.264 | `x264enc` | Software | High | Good |
-| H.264 | `vah264enc` | Hardware (VA-API) | Low | Good |
-| H.265 | `x265enc` | Software | High | Better |
-| H.265 | `vah265enc` | Hardware (VA-API) | Low | Better |
-| AV1 | `svtav1enc` | Software | Medium | Best |
+| Codec | Encoder | Type | CPU Usage | Selectable |
+|-------|---------|------|-----------|------------|
+| H.264 | `vah264enc` | Hardware (VA-API) | Low | `--codec h264` |
+| H.264 | `x264enc` | Software | High | `--codec h264-sw` |
+| H.265 | `x265enc` / `vah265enc` | Software / Hardware | High / Low | not exposed |
+| AV1 | `svtav1enc` | Software | Medium | not exposed |
+
+H.265 and AV1 exist in the encoder layer but are not reachable from the CLI:
+`--codec` accepts `auto`, `h264` and `h264-sw` only.
 
 ### CLI Options
 
 ```bash
-# Auto-select best codec (default) - prefers hardware H.265 if TV supports it
+# Auto-select (default) - hardware H.264 when available
 swaybeam daemon --sink "TV" --client
-
-# Force H.265 with hardware encoding
-swaybeam daemon --sink "TV" --client --codec h265
-
-# Force H.265 with software encoding (fallback)
-swaybeam daemon --sink "TV" --client --codec h265-sw
 
 # Force H.264 with hardware encoding
 swaybeam daemon --sink "TV" --client --codec h264
@@ -214,6 +242,14 @@ swaybeam daemon --sink "TV" --client --codec h264
 # Force H.264 with software encoding (most compatible)
 swaybeam daemon --sink "TV" --client --codec h264-sw
 ```
+
+> **Auto-selection always lands on H.264 today.** HEVC is advertised by sinks
+> in WFD 2.0's `wfd2_video_formats`, which swaybeam does not request, so
+> nothing in a normal capability exchange makes H.265 negotiable. Enabling it
+> means requesting and parsing that parameter, not inspecting
+> `wfd_video_formats` harder -- an earlier version appeared to auto-select
+> H.265 by reading that parameter's H.264 *level* field as a codec bitmask,
+> and level 4.2 encodes as `10`, so every level-4.2 sink looked HEVC-capable.
 
 ### Hardware Encoding Dependencies
 
@@ -293,6 +329,28 @@ sudo pacman -S gst-plugins-ugly
 sudo apt install gstreamer1.0-plugins-ugly
 ```
 
+### Sink connects, then drops after a few seconds
+
+Almost always host configuration rather than swaybeam. Miracast has the *sink*
+open a TCP connection back to the source, so port 7236 has to be reachable and
+the Wi-Fi Direct interface must not be filtered. Both are blocked by default on
+a typical Arch install, and the failure is silent -- the TV simply never gets a
+reply.
+
+```bash
+# Firewall -- check both, they stack
+sudo ufw allow 7236/tcp                  # `systemctl is-active ufw` reporting
+                                         # "inactive" does NOT mean its rules
+                                         # are unloaded
+sudo nft list ruleset | grep 7236        # nftables: add `tcp dport 7236 accept`
+                                         # to the input chain
+
+# Reverse-path filtering drops P2P packets before any firewall rule sees them
+sudo sysctl -w net.ipv4.conf.all.rp_filter=2
+sudo sysctl -w net.ipv4.conf.default.rp_filter=2
+nstat -az | grep IPReversePathFilter     # climbing? this is your problem
+```
+
 ### "Portal request was cancelled by user"
 
 This means `xdg-desktop-portal-wlr` failed to start. The most common cause on Sway is that `WAYLAND_DISPLAY` is not in the systemd user environment.
@@ -348,7 +406,11 @@ exec_always --no-startup-id systemctl --user restart xdg-desktop-portal.service 
 - ✅ GStreamer H.264/H.265/AV1 encoding (stream)
 - ✅ Session orchestration (daemon)
 - ✅ CLI interface
-- ⏳ Real hardware testing needed
+- ✅ Extend-desktop mode (Hyprland; headless output + portal auto-select)
+- ✅ Verified end to end against real hardware (LG webOS TV OLED55B9PLA):
+  extended desktop, working mouse and keyboard
+- ⏳ HDCP not implemented (sinks advertising it have so far not required it)
+- ⏳ Sinks generally need 30-60s between sessions before accepting a reconnect
 
 ## License
 
