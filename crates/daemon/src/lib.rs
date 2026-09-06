@@ -81,6 +81,10 @@ pub struct Daemon {
     event_tx: mpsc::UnboundedSender<DaemonEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<DaemonEvent>>,
     audio_sink: Option<VirtualAudioSink>,
+    /// The single mode committed to in M4. The pipeline must produce exactly
+    /// this geometry: M4 is a promise, and encoding something else makes the
+    /// sink decode a stream whose dimensions it was told to expect elsewhere.
+    selected_video_mode: Option<swaybeam_rtsp::SelectedVideoMode>,
 }
 
 #[derive(Debug)]
@@ -147,6 +151,7 @@ impl Daemon {
             connection: None,
             rtsp_server: None,
             virtual_output: None,
+            selected_video_mode: None,
             event_tx,
             event_rx: Some(event_rx),
             audio_sink: None,
@@ -224,6 +229,12 @@ impl Daemon {
     async fn teardown(&mut self) -> anyhow::Result<()> {
         self.stop_stream().await.ok();
         self.disconnect().await.ok();
+
+        // Belongs to the session that negotiated it. Left set, a reused
+        // Daemon whose next negotiation falls back to the generic capability
+        // string would still size its pipeline from the *previous* sink --
+        // streaming one geometry while M4 announced another.
+        self.selected_video_mode = None;
 
         if let Some(ref mut output) = self.virtual_output {
             info!("Cleaning up virtual output...");
@@ -1755,22 +1766,56 @@ impl Daemon {
         let sink_caps = rtsp_client.send_get_parameter(params_to_request).await?;
         info!("Sink capabilities: {:?}", sink_caps);
 
-        let prefer_hevc = if let Some(codec) = &self.config.video_codec {
-            codec.is_hevc()
-        } else {
-            sink_caps
-                .get("wfd_video_formats")
-                .map(|formats| formats.contains("02"))
-                .unwrap_or(false)
-                && !self.config.extend_mode
-        };
+        // Drop any previous session's selection before choosing again: the
+        // fallback branch below must mean "no mode was selected", not "keep
+        // whatever the last sink agreed to".
+        self.selected_video_mode = None;
 
-        let selected_video_format = sink_caps
-            .get("wfd_video_formats")
-            .map(|formats| {
-                swaybeam_rtsp::WfdCapabilities::select_video_formats(formats, prefer_hevc)
-            })
-            .unwrap_or_else(swaybeam_rtsp::WfdCapabilities::build_video_formats);
+        // Commit to exactly one mode, and to one we can actually produce: the
+        // encoder is already configured for this geometry by the time we get
+        // here, so a selection the pipeline can't honour would just be a
+        // different way of lying to the sink.
+        let selected = sink_caps.get("wfd_video_formats").and_then(|formats| {
+            swaybeam_rtsp::WfdCapabilities::select_video_mode(
+                formats,
+                self.config.video_width,
+                self.config.video_height,
+                self.config.video_framerate,
+            )
+        });
+
+        let selected_video_format = match selected {
+            Some(mode) => {
+                if mode.width != self.config.video_width
+                    || mode.height != self.config.video_height
+                    || mode.framerate != self.config.video_framerate
+                {
+                    info!(
+                        "Sink's best offer is {}x{}p{}, not the {}x{}p{} the capture is \
+                         sized for; the pipeline will scale to the selected mode",
+                        mode.width,
+                        mode.height,
+                        mode.framerate,
+                        self.config.video_width,
+                        self.config.video_height,
+                        self.config.video_framerate
+                    );
+                }
+                let formats = mode.wfd_video_formats.clone();
+                // Remember it: M4 has now promised this exact geometry, and
+                // start_negotiated_stream has to build a pipeline that keeps
+                // the promise rather than one sized from config.
+                self.selected_video_mode = Some(mode);
+                formats
+            }
+            None => {
+                warn!(
+                    "Could not select a video mode from the sink's wfd_video_formats; \
+                     falling back to our own capability string, which the sink may not honour"
+                );
+                swaybeam_rtsp::WfdCapabilities::build_video_formats()
+            }
+        };
 
         info!("Selected video format: {}", selected_video_format);
 
@@ -1804,17 +1849,22 @@ impl Daemon {
             return codec.clone();
         }
 
-        let hevc_supported = sink_caps
-            .get("wfd_video_formats")
-            .map(|formats| formats.contains("02"))
-            .unwrap_or(false);
+        // Ask the parser, not the raw text. This used to be
+        // `formats.contains("02")`, which matches anywhere in the value --
+        // a CEA bitmap of 00000200, a latency field, a max-hres of 0200 --
+        // so a sink advertising no HEVC at all could still be sent an H.265
+        // stream, and one that M4 had just promised H.264 for.
+        let mut caps = swaybeam_rtsp::WfdCapabilities::new();
+        caps.video_formats = sink_caps.get("wfd_video_formats").cloned();
+        let negotiated = caps.negotiate_video_codec();
 
+        let hevc_supported = matches!(negotiated, NegotiatedCodec::H265);
         let prefer_hevc = hevc_supported && !self.config.extend_mode;
 
         let selected = StreamPipeline::select_best_codec(prefer_hevc);
         info!(
-            "Auto-selected codec: {} (HEVC supported by TV: {})",
-            selected, hevc_supported
+            "Auto-selected codec: {} (sink negotiated as {:?})",
+            selected, negotiated
         );
         selected
     }
@@ -1859,17 +1909,30 @@ impl Daemon {
         // now come from this one place, in the right order.
         self.event_tx.send(DaemonEvent::Negotiated).ok();
 
-        // Must match what run_inner() sized the virtual output to for
-        // extend mode, and what the sink can actually decode -- see the
-        // 1080p rationale there.
-        let (width, height, bitrate) = if self.config.extend_mode {
-            (1920, 1080, 10_000_000u32)
-        } else {
-            (
+        // Whatever M4 committed to wins. Falling back to the extend-mode
+        // default here would let the source promise the sink one geometry and
+        // send another -- a 720p-only sink would be told 720p and handed
+        // 1080p, which is exactly the sort of mismatch that leaves a TV
+        // showing nothing while every local check looks healthy.
+        let (width, height, framerate, bitrate) = match &self.selected_video_mode {
+            Some(mode) => {
+                let bitrate = if self.config.extend_mode {
+                    10_000_000u32
+                } else {
+                    self.config.video_bitrate
+                };
+                (mode.width, mode.height, mode.framerate, bitrate)
+            }
+            // Must match what run_inner() sized the virtual output to for
+            // extend mode, and what the sink can actually decode -- see the
+            // 1080p rationale there.
+            None if self.config.extend_mode => (1920, 1080, self.config.video_framerate, 10_000_000u32),
+            None => (
                 self.config.video_width,
                 self.config.video_height,
+                self.config.video_framerate,
                 self.config.video_bitrate,
-            )
+            ),
         };
 
         let stream_config = StreamConfig {
@@ -1877,7 +1940,7 @@ impl Daemon {
             video_bitrate: bitrate,
             video_width: width,
             video_height: height,
-            video_framerate: self.config.video_framerate,
+            video_framerate: framerate,
             audio_codec: AudioCodec::AAC,
             audio_bitrate: 128_000,
             audio_sample_rate: 48000,
@@ -1942,6 +2005,7 @@ impl Daemon {
         // flowing. Caught live: the omarchy-wireless-display panel sat on
         // "Connecting…" through a working, streaming session.
         self.event_tx.send(DaemonEvent::StreamingStarted).ok();
+
         Ok(())
     }
 }

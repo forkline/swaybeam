@@ -146,18 +146,32 @@ fn test_session_state_machine_m1_m7() {
     assert_eq!(session.state, SessionState::Teardown);
 }
 
-/// Test that we advertise correct video formats
+/// Test that we advertise a well-formed video format.
+///
+/// This used to assert the value contained `0000000000000017`, read as
+/// "H.264 (0x07) plus H.265 (0x10)". No such codec bitmask exists in
+/// `wfd_video_formats`: the parameter is thirteen fields describing H.264
+/// profiles, levels and resolution bitmaps, and the old four-field value was
+/// simply malformed. Nothing noticed because the old parser never indexed
+/// past field 3.
 #[test]
 fn test_source_video_formats() {
     let caps = WfdCapabilities::source_capabilities();
     let video_formats = caps.video_formats.unwrap();
 
-    // Should advertise H.264 (bit 0-2) and H.265 (bit 4)
-    // Format mask should include 0x07 (H.264) + 0x10 (H.265) = 0x17
-    assert!(
-        video_formats.contains("0000000000000017"),
-        "Should advertise H.264 and H.265 support"
+    let parsed = swaybeam_rtsp::parse_sink_video_formats(&video_formats)
+        .expect("our own advertised value must parse as wfd_video_formats");
+
+    assert_eq!(parsed.entries.len(), 1, "one codec entry");
+    let entry = &parsed.entries[0];
+    assert_eq!(entry.profile, 0x01, "constrained baseline");
+    assert_eq!(
+        entry.cea.count_ones(),
+        1,
+        "a single offered mode, not a bitmap of options"
     );
+    assert_eq!(entry.cea, 1 << 7, "CEA bit 7 is 1920x1080p30");
+    assert_eq!((entry.vesa, entry.hh), (0, 0), "CEA only");
 }
 
 /// Test that we advertise correct audio codecs
