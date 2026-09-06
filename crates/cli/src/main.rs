@@ -10,8 +10,21 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "swaybeam")]
 #[command(about = "Miracast source for wlroots-based compositors")]
 struct Cli {
-    #[arg(long)]
+    /// Emit machine-readable output: one JSON object per line on stdout,
+    /// with logs routed to stderr so stdout stays parseable.
+    // `global = true` so this is accepted both before and after the
+    // subcommand -- `swaybeam --json daemon` and `swaybeam daemon --json`
+    // both work. Without it clap only accepts the former, while this
+    // project's own docs and commit messages use the latter.
+    #[arg(long, global = true)]
     json: bool,
+
+    /// Wi-Fi interface for P2P/Wi-Fi Direct discovery and connections. If
+    /// discovery finds nothing, check `iw dev` -- the "wlan0" default is
+    /// the old kernel-numbered naming, and most current systems use
+    /// predictable names like "wlp0s20f3" instead.
+    #[arg(long, global = true, default_value = "wlan0")]
+    interface: String,
 
     #[command(subcommand)]
     command: Command,
@@ -60,12 +73,21 @@ enum Command {
         sink: Option<String>,
         #[arg(short, long)]
         client: bool,
+        /// Extend the desktop onto the sink via a 1080p virtual output,
+        /// rather than mirroring an existing one. Not 4K: classic
+        /// Miracast/WFD tops out at 1920x1080 (see --external).
         #[arg(long)]
         extend: bool,
         #[arg(long)]
         audio: bool,
         #[arg(long, value_enum, default_value = "auto")]
         codec: CodecChoice,
+        /// Virtual output size for a fixed external resolution. Note that
+        /// `4k` is almost never negotiable: the CEA/VESA/HH resolution
+        /// bitmaps sinks advertise in wfd_video_formats have no 4K entries
+        /// at all (that needs WFD 2.0), so a 4K-capable TV will still
+        /// typically cap at 1920x1080 and silently fail to decode anything
+        /// larger.
         #[arg(long, value_enum)]
         external: Option<ExternalResolutionChoice>,
     },
@@ -82,22 +104,33 @@ struct SinkRow {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    // Parse before installing the subscriber, because where tracing writes
+    // depends on the mode: tracing_subscriber's default writer is *stdout*,
+    // which in --json mode interleaves formatted log lines with the NDJSON
+    // event stream the moment RUST_LOG is set or any error event fires --
+    // and a consumer parsing stdout line-by-line as JSON chokes on them.
+    // stdout stays machine-only; diagnostics go to stderr.
+    let subscriber = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    if cli.json {
+        subscriber.with_writer(std::io::stderr).init();
+    } else {
+        subscriber.init();
+    }
 
     match &cli.command {
         Command::Doctor => doctor_command(cli.json).await,
-        Command::Discover { timeout } => discover_command(*timeout, cli.json).await,
-        Command::Connect { sink } => connect_command(sink, cli.json).await,
+        Command::Discover { timeout } => {
+            discover_command(*timeout, &cli.interface, cli.json).await
+        }
+        Command::Connect { sink } => connect_command(sink, &cli.interface, cli.json).await,
         Command::Stream {
             width,
             height,
             framerate,
         } => stream_command(*width, *height, *framerate, cli.json).await,
-        Command::Disconnect => disconnect_command(cli.json).await,
+        Command::Disconnect => disconnect_command(&cli.interface, cli.json).await,
         Command::Daemon {
             sink,
             client,
@@ -113,6 +146,7 @@ async fn main() -> Result<()> {
                 *audio,
                 codec.clone(),
                 external.clone(),
+                &cli.interface,
                 cli.json,
             )
             .await
@@ -145,11 +179,11 @@ async fn doctor_command(json_output: bool) -> Result<()> {
     Ok(())
 }
 
-async fn discover_command(timeout: u64, json_output: bool) -> Result<()> {
+async fn discover_command(timeout: u64, interface: &str, json_output: bool) -> Result<()> {
     use swaybeam_net::{P2pConfig, P2pManager};
 
     let config = P2pConfig {
-        interface_name: "wlan0".to_string(),
+        interface_name: interface.to_string(),
         group_name: "swaybeam".to_string(),
     };
 
@@ -191,11 +225,11 @@ async fn discover_command(timeout: u64, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-async fn connect_command(sink_param: &str, json_output: bool) -> Result<()> {
+async fn connect_command(sink_param: &str, interface: &str, json_output: bool) -> Result<()> {
     use swaybeam_net::{P2pConfig, P2pManager};
 
     let config = P2pConfig {
-        interface_name: "wlan0".to_string(),
+        interface_name: interface.to_string(),
         group_name: "swaybeam".to_string(),
     };
 
@@ -277,11 +311,11 @@ async fn stream_command(width: u32, height: u32, framerate: u32, json_output: bo
     Ok(())
 }
 
-async fn disconnect_command(json_output: bool) -> Result<()> {
+async fn disconnect_command(interface: &str, json_output: bool) -> Result<()> {
     use swaybeam_net::{P2pConfig, P2pManager};
 
     let config = P2pConfig {
-        interface_name: "wlan0".to_string(),
+        interface_name: interface.to_string(),
         group_name: "swaybeam".to_string(),
     };
 
@@ -302,6 +336,48 @@ async fn disconnect_command(json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Renders one JSON object per `DaemonEvent`, in the shape `crates/daemon`'s
+/// event stream is turned into on stdout for `daemon --json`. Kept separate
+/// from `crates/daemon` deliberately: the daemon crate stays protocol/format
+/// agnostic (it only knows about the typed `DaemonEvent` enum), and the CLI
+/// crate — which already depends on `serde_json` for every other
+/// subcommand's `--json` output — owns turning events into wire JSON.
+fn daemon_event_json(event: swaybeam_daemon::DaemonEvent) -> serde_json::Value {
+    use swaybeam_daemon::DaemonEvent;
+
+    match event {
+        DaemonEvent::Started => json!({"event": "started"}),
+        DaemonEvent::Discovered(sinks) => json!({
+            "event": "discovered",
+            "sinks": sinks.iter().map(sink_json).collect::<Vec<_>>(),
+        }),
+        DaemonEvent::Connected(sink) => json!({
+            "event": "connected",
+            "sink": sink_json(&sink),
+        }),
+        DaemonEvent::VirtualOutputCreated { name, width, height } => json!({
+            "event": "virtual_output_created",
+            "name": name,
+            "width": width,
+            "height": height,
+        }),
+        DaemonEvent::Negotiated => json!({"event": "negotiated"}),
+        DaemonEvent::StreamingStarted => json!({"event": "streaming_started"}),
+        DaemonEvent::StreamingStopped => json!({"event": "streaming_stopped"}),
+        DaemonEvent::ErrorOccurred(message) => json!({"event": "error", "message": message}),
+        DaemonEvent::Ended => json!({"event": "ended"}),
+    }
+}
+
+fn sink_json(sink: &swaybeam_net::Sink) -> serde_json::Value {
+    json!({
+        "name": &sink.name,
+        "address": &sink.address,
+        "ip_address": &sink.ip_address,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn daemon_command(
     sink: Option<String>,
     client_mode: bool,
@@ -309,30 +385,33 @@ async fn daemon_command(
     audio: bool,
     codec: CodecChoice,
     external: Option<ExternalResolutionChoice>,
-    _json_output: bool,
+    interface: &str,
+    json_output: bool,
 ) -> Result<()> {
     use swaybeam_daemon::{Daemon, DaemonConfig};
     use swaybeam_external::ExternalResolution;
     use swaybeam_stream::VideoCodec;
 
-    println!("Starting Miracast daemon...");
-    if client_mode {
-        println!("Running in RTSP client mode (TV is Group Owner)");
-    }
-    if extend_mode {
-        println!("Running in extend mode (4K virtual output)");
-    }
-    if audio {
-        println!("Audio enabled - virtual sink will be created");
-    }
-    if let Some(ref ext) = external {
-        let resolution_str = match ext {
-            ExternalResolutionChoice::Auto => "auto",
-            ExternalResolutionChoice::FourK => "4K",
-            ExternalResolutionChoice::TenEighty => "1080p",
-            ExternalResolutionChoice::SevenTwenty => "720p",
-        };
-        println!("External monitor enabled - resolution: {}", resolution_str);
+    if !json_output {
+        println!("Starting Miracast daemon...");
+        if client_mode {
+            println!("Running in RTSP client mode (TV is Group Owner)");
+        }
+        if extend_mode {
+            println!("Running in extend mode (1080p virtual output)");
+        }
+        if audio {
+            println!("Audio enabled - virtual sink will be created");
+        }
+        if let Some(ref ext) = external {
+            let resolution_str = match ext {
+                ExternalResolutionChoice::Auto => "auto",
+                ExternalResolutionChoice::FourK => "4K",
+                ExternalResolutionChoice::TenEighty => "1080p",
+                ExternalResolutionChoice::SevenTwenty => "720p",
+            };
+            println!("External monitor enabled - resolution: {}", resolution_str);
+        }
     }
 
     let video_codec = match codec {
@@ -355,12 +434,43 @@ async fn daemon_command(
         enable_audio: audio,
         video_codec,
         external_resolution,
+        interface: interface.to_string(),
         ..Default::default()
     };
     let mut daemon = Daemon::with_config(config);
 
-    if let Err(e) = daemon.run().await {
-        eprintln!("Daemon error: {}", e);
+    // Subscribed before `run()` so no early event (Started, in particular)
+    // can be missed; drained on a separate task so a slow/absent reader on
+    // the other end of stdout can't backpressure the daemon's own state
+    // machine (the channel is unbounded — see crates/daemon).
+    let drain_handle = if json_output {
+        let mut rx = daemon
+            .subscribe_events()
+            .expect("subscribe_events() only returns None if called twice");
+        Some(tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let Ok(line) = serde_json::to_string(&daemon_event_json(event)) {
+                    println!("{}", line);
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let result = daemon.run().await;
+    if let Err(ref e) = result {
+        if !json_output {
+            eprintln!("Daemon error: {}", e);
+        }
+    }
+
+    // Drop the daemon (and with it the event channel's sender) before
+    // awaiting the drain task, or that task's `rx.recv()` would wait
+    // forever for a close that a still-alive sender will never send.
+    drop(daemon);
+    if let Some(handle) = drain_handle {
+        handle.await.ok();
     }
 
     Ok(())
@@ -412,5 +522,61 @@ mod tests {
 
         let cmd = Cli::try_parse_from(["swaybeam", "status"]);
         assert!(cmd.is_ok());
+    }
+
+    // Pins the wire shape omarchy-wireless-displayd parses `daemon --json`
+    // output against — a field rename here is a breaking change for that
+    // consumer, so it should fail a test, not just a changelog note.
+    #[test]
+    fn daemon_event_json_shapes() {
+        use swaybeam_daemon::DaemonEvent;
+        use swaybeam_net::Sink;
+
+        assert_eq!(
+            daemon_event_json(DaemonEvent::Started),
+            json!({"event": "started"})
+        );
+
+        assert_eq!(
+            daemon_event_json(DaemonEvent::VirtualOutputCreated {
+                name: "HEADLESS-1".to_string(),
+                width: 1920,
+                height: 1080,
+            }),
+            json!({
+                "event": "virtual_output_created",
+                "name": "HEADLESS-1",
+                "width": 1920,
+                "height": 1080,
+            })
+        );
+
+        let sink = Sink {
+            name: "Living Room TV".to_string(),
+            address: "aa:bb:cc:dd:ee:01".to_string(),
+            peer_path: None,
+            ip_address: Some("192.168.49.1".to_string()),
+            go_ip_address: None,
+            rtsp_port: 7236,
+            wfd_capabilities: None,
+        };
+        assert_eq!(
+            daemon_event_json(DaemonEvent::Connected(sink)),
+            json!({
+                "event": "connected",
+                "sink": {
+                    "name": "Living Room TV",
+                    "address": "aa:bb:cc:dd:ee:01",
+                    "ip_address": "192.168.49.1",
+                }
+            })
+        );
+
+        assert_eq!(
+            daemon_event_json(DaemonEvent::ErrorOccurred("Sink 'x' not found".to_string())),
+            json!({"event": "error", "message": "Sink 'x' not found"})
+        );
+
+        assert_eq!(daemon_event_json(DaemonEvent::Ended), json!({"event": "ended"}));
     }
 }

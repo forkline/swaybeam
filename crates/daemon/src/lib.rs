@@ -81,6 +81,10 @@ pub struct Daemon {
     event_tx: mpsc::UnboundedSender<DaemonEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<DaemonEvent>>,
     audio_sink: Option<VirtualAudioSink>,
+    /// The single mode committed to in M4. The pipeline must produce exactly
+    /// this geometry: M4 is a promise, and encoding something else makes the
+    /// sink decode a stream whose dimensions it was told to expect elsewhere.
+    selected_video_mode: Option<swaybeam_rtsp::SelectedVideoMode>,
 }
 
 #[derive(Debug)]
@@ -88,6 +92,11 @@ pub enum DaemonEvent {
     Started,
     Discovered(Vec<Sink>),
     Connected(Sink),
+    /// Emitted once a headless/virtual output is created for extend mode
+    /// (or a fixed external resolution) — carries the compositor-assigned
+    /// output name (e.g. "HEADLESS-1") a caller needs to do anything with
+    /// it (place it in a layout, report it to a UI, etc.).
+    VirtualOutputCreated { name: String, width: u32, height: u32 },
     Negotiated,
     StreamingStarted,
     StreamingStopped,
@@ -142,6 +151,7 @@ impl Daemon {
             connection: None,
             rtsp_server: None,
             virtual_output: None,
+            selected_video_mode: None,
             event_tx,
             event_rx: Some(event_rx),
             audio_sink: None,
@@ -152,13 +162,133 @@ impl Daemon {
         self.state.read().clone()
     }
 
+    /// Runs one full session (discover -> connect -> [virtual output] ->
+    /// negotiate -> stream -> wait for Ctrl+C -> teardown), reporting every
+    /// stage through the event channel (`subscribe_events`) as well as the
+    /// returned `Result` — a caller only watching events still sees a
+    /// terminal `ErrorOccurred` followed by `Ended` on failure, since
+    /// `run_inner`'s early-return `?`s would otherwise be invisible to
+    /// anyone not also awaiting this future directly.
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        // Installed before the session starts, and raced against the whole
+        // of it -- not just the streaming wait at the end. Startup is
+        // exactly where a stop signal is most likely to land badly:
+        // discovery, connect and negotiation each sit on 10-15s timeouts,
+        // and previously a SIGTERM anywhere in there killed the process
+        // outright with the virtual output, portal override and audio sink
+        // already created and no teardown. SIGKILL still can't be caught --
+        // cleanup_stale is what recovers from that one.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| anyhow::anyhow!("Failed to install SIGTERM handler: {}", e))?;
+        let shutdown = async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        };
+        tokio::pin!(shutdown);
+
+        // Startup, cancellable. Dropping run_inner at an await point leaves
+        // whatever it built recorded on `self`, which the teardown below
+        // then unwinds.
+        let mut result = tokio::select! {
+            r = self.run_inner() => r,
+            sig = &mut shutdown => {
+                info!("Received {} during startup, shutting down", sig);
+                Ok(())
+            }
+        };
+
+        // Reached streaming: hold here until asked to stop.
+        if result.is_ok() && *self.state.read() == DaemonState::Streaming {
+            info!("Streaming active, press Ctrl+C to stop...");
+            let sig = (&mut shutdown).await;
+            info!("Received {}, shutting down", sig);
+        }
+
+        if let Err(e) = self.teardown().await {
+            warn!("Teardown reported a problem: {}", e);
+            if result.is_ok() {
+                result = Err(e);
+            }
+        }
+
+        if let Err(ref e) = result {
+            self.event_tx
+                .send(DaemonEvent::ErrorOccurred(e.to_string()))
+                .ok();
+        }
+        self.event_tx.send(DaemonEvent::Ended).ok();
+        result
+    }
+
+    /// Unwinds everything a session created, in reverse order. Safe to call
+    /// at any point in the lifecycle -- each step is skipped if that
+    /// resource was never created, so a signal during startup tears down
+    /// exactly as much as exists.
+    async fn teardown(&mut self) -> anyhow::Result<()> {
+        self.stop_stream().await.ok();
+        self.disconnect().await.ok();
+
+        // Belongs to the session that negotiated it. Left set, a reused
+        // Daemon whose next negotiation falls back to the generic capability
+        // string would still size its pipeline from the *previous* sink --
+        // streaming one geometry while M4 announced another.
+        self.selected_video_mode = None;
+
+        if let Some(ref mut output) = self.virtual_output {
+            info!("Cleaning up virtual output...");
+            output
+                .cleanup()
+                .map_err(|e| tracing::warn!("Failed to cleanup virtual output: {}", e))
+                .ok();
+        }
+        self.virtual_output = None;
+
+        if let Some(ref mut audio_sink) = self.audio_sink {
+            info!("Cleaning up virtual audio sink...");
+            audio_sink
+                .cleanup()
+                .map_err(|e| tracing::warn!("Failed to cleanup audio sink: {}", e))
+                .ok();
+        }
+        self.audio_sink = None;
+
+        info!("Daemon stopped");
+        *self.state.write() = DaemonState::Idle;
+        Ok(())
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
         info!("Daemon starting...");
+
+        // Recover from a *previous* session that never reached its own
+        // graceful teardown -- a crash, a SIGKILL, a suspend that didn't
+        // resume cleanly all skip VirtualOutput/VirtualAudioSink's Drop.
+        // Confirmed live this is a real exposure: a run against a real TV
+        // died mid-retry with no graceful shutdown at all and left a
+        // headless output, an xdph.conf edit, a marker file, and the
+        // virtual audio sink (still the default output) all behind,
+        // needing manual recovery. Run before touching anything else so
+        // every session starts from a known-clean slate regardless of how
+        // the last one ended. Best-effort: a failure here shouldn't block
+        // starting a new session, it just means whatever didn't get
+        // cleaned stays around for the next attempt too.
+        if let Err(e) = swaybeam_external::cleanup_stale() {
+            tracing::warn!("Stale virtual-output cleanup failed: {}", e);
+        }
+        if let Err(e) = swaybeam_audio::cleanup_stale() {
+            tracing::warn!("Stale virtual-audio-sink cleanup failed: {}", e);
+        }
+
         *self.state.write() = DaemonState::Discovering;
         self.event_tx.send(DaemonEvent::Started).ok();
 
         let sinks = self.discover().await?;
         debug!("Discovered {} sink(s)", sinks.len());
+        self.event_tx
+            .send(DaemonEvent::Discovered(sinks.clone()))
+            .ok();
 
         if sinks.is_empty() {
             return Err(anyhow::anyhow!("No Miracast sinks discovered"));
@@ -178,16 +308,40 @@ impl Daemon {
         self.connect(sink).await?;
 
         if self.config.extend_mode {
-            let output =
-                tokio::task::block_in_place(|| VirtualOutput::create(ExternalResolution::FourK))
-                    .map_err(|e| anyhow::anyhow!("Failed to create virtual output: {}", e))?;
+            // 1080p, not 4K. Classic Miracast/WFD tops out at 1920x1080:
+            // the CEA/VESA/HH resolution bitmaps a sink advertises in
+            // wfd_video_formats have no 4K entries at all (that needs WFD
+            // 2.0 extensions). Confirmed live against a real LG B9 OLED --
+            // a 4K-capable TV, which still advertised
+            // CEA=0x000194FF (max 1920x1080p30) -- where sending 3840x2160
+            // produced a steady RTP flow the TV simply could not decode:
+            // spinner on screen, no picture, while Hyprland happily showed
+            // the extended output on our side.
+            //
+            // Fixed size rather than derived from the sink's advertised
+            // formats because the virtual output has to exist *before* the
+            // RTSP capability exchange that reveals them; deriving it
+            // properly means reordering those two phases (see
+            // parse_resolution_from_wfd_formats, which already decodes the
+            // bitmaps and is what that refactor should feed from).
+            let output = tokio::task::block_in_place(|| {
+                VirtualOutput::create(ExternalResolution::TenEighty)
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to create virtual output: {}", e))?;
             info!(
-                "Virtual output '{}' configured for 4K extend mode",
+                "Virtual output '{}' configured for 1080p extend mode",
                 output.output_name()
             );
-            self.config.video_width = 3840;
-            self.config.video_height = 2160;
-            self.config.video_bitrate = 20_000_000;
+            self.event_tx
+                .send(DaemonEvent::VirtualOutputCreated {
+                    name: output.output_name().to_string(),
+                    width: 1920,
+                    height: 1080,
+                })
+                .ok();
+            self.config.video_width = 1920;
+            self.config.video_height = 1080;
+            self.config.video_bitrate = 10_000_000;
             self.config.video_framerate = 30;
             self.virtual_output = Some(output);
         } else if let Some(resolution) = self.config.external_resolution {
@@ -198,6 +352,13 @@ impl Daemon {
                 output.output_name(),
                 resolution.mode_string()
             );
+            self.event_tx
+                .send(DaemonEvent::VirtualOutputCreated {
+                    name: output.output_name().to_string(),
+                    width: resolution.width(),
+                    height: resolution.height(),
+                })
+                .ok();
             self.config.video_width = resolution.width();
             self.config.video_height = resolution.height();
             self.config.video_bitrate = if resolution == ExternalResolution::FourK {
@@ -230,33 +391,9 @@ impl Daemon {
             self.start_stream().await?;
         }
 
-        info!("Streaming active, press Ctrl+C to stop...");
-        tokio::signal::ctrl_c().await.ok();
-
-        self.stop_stream().await.ok();
-        self.disconnect().await.ok();
-
-        if let Some(ref mut output) = self.virtual_output {
-            info!("Cleaning up virtual output...");
-            output
-                .cleanup()
-                .map_err(|e| tracing::warn!("Failed to cleanup virtual output: {}", e))
-                .ok();
-        }
-        self.virtual_output = None;
-
-        if let Some(ref mut audio_sink) = self.audio_sink {
-            info!("Cleaning up virtual audio sink...");
-            audio_sink
-                .cleanup()
-                .map_err(|e| tracing::warn!("Failed to cleanup audio sink: {}", e))
-                .ok();
-        }
-        self.audio_sink = None;
-
-        info!("Daemon stopped");
-        *self.state.write() = DaemonState::Idle;
-
+        // Waiting for a stop signal and tearing down both live in run(),
+        // so that a signal arriving during *startup* -- before this point
+        // is ever reached -- unwinds just as cleanly.
         Ok(())
     }
 
@@ -331,12 +468,28 @@ impl Daemon {
             // Connect as RTSP client to the sink's RTSP server
             self.negotiate_as_client().await?;
         } else {
-            // Act as RTSP server (traditional source mode)
-            self.negotiate_as_server().await?;
+            // The sink opens the TCP connection to us -- but in WFD the
+            // *source* drives the RTSP conversation regardless of who dialled
+            // (M1 OPTIONS, M3/M4 capability exchange, M5 wfd_trigger_method:
+            // SETUP, then the sink answers with SETUP+PLAY). So this listens,
+            // then drives, via negotiate_as_reverse_client.
+            //
+            // NOT negotiate_as_server(): that path listens but is purely
+            // *reactive* -- its handle_connection() blocks on socket.read()
+            // waiting for the sink to send the first request. Confirmed live
+            // against a real LG TV with a packet capture: the TCP handshake
+            // completed, then both sides sat silent for exactly 10s (zero
+            // RTSP bytes in either direction) before the TV gave up and sent
+            // RST. No real WFD sink drives the exchange, because the spec
+            // says the source does.
+            let (go_ip, rtsp_port) = self.reverse_rtsp_target()?;
+            self.negotiate_as_reverse_client(&go_ip, rtsp_port).await?;
         }
 
         info!("RTSP negotiation completed");
-        self.event_tx.send(DaemonEvent::Negotiated).ok();
+        // DaemonEvent::Negotiated is emitted from start_negotiated_stream(),
+        // not here -- see the comment there. Emitting it at this point put
+        // it *after* StreamingStarted in the event stream.
 
         Ok(())
     }
@@ -374,6 +527,16 @@ impl Daemon {
         *self.stream.write().await = Some(pipeline);
         info!("Stream pipeline started");
         self.event_tx.send(DaemonEvent::StreamingStarted).ok();
+
+        // The pipeline is live but the compositor has no reason to draw an
+        // untouched virtual output, so nudge it. This has to happen *after*
+        // the pipeline is running -- a frame produced before then is simply
+        // missed, and we are back to waiting for something incidental to
+        // damage the output. The second nudge covers the case where the
+        // first raced the capture's own start-up.
+        if let Some(ref output) = self.virtual_output {
+            output.force_repaint();
+        }
 
         Ok(())
     }
@@ -422,19 +585,33 @@ impl Daemon {
                 );
             }
 
-            // In Wi-Fi Direct, sometimes the device type information indicates role
-            // but detection logic can be complex. A common situation is that TVs
-            // can operate in GO role despite being sinks conceptually.
-            // Try heuristics, or just return a reasonable default
+            // A previous version of this function used exactly this
+            // signal -- Sink::go_ip_address differing from our own
+            // address, meaning the peer is the P2P group owner -- to infer
+            // "GO sink runs its own RTSP server, negotiate as client",
+            // reasoning from the WFD spec's nominal role assignment.
+            // Packet capture against a real LG TV (as GO) proved that
+            // reasoning wrong for real hardware: the TV repeatedly SYNs
+            // *our* port 7236 (as a client, from the moment the P2P group
+            // forms) while nothing we send it ever gets more than an
+            // immediate RST -- it wants the traditional roles (source =
+            // RTSP server) regardless of which side is the P2P GO. Worse,
+            // guessing client mode first burns most of the TV's own ~8-10s
+            // patience window dialing a connection nobody answers, so by
+            // the time this would fall back to server mode the TV has
+            // already torn down the P2P group. GO status is not a reliable
+            // signal for RTSP role -- default to server mode unless a user
+            // explicitly knows their sink needs `--client`.
+            if let Some(ref go_ip) = sink.go_ip_address {
+                debug!(
+                    "Sink's P2P group owner is {} (informational only -- not used to infer \
+                     RTSP role, see comment above)",
+                    go_ip
+                );
+            }
 
-            // For now, just use force mechanism, or fallback to default
-            // A sophisticated detection could check:
-            // 1. Network address patterns (TV often ends in .1 or .254)
-            // 2. MAC OUI patterns
-            // 3. Known device type patterns
-            // 4. Test for RTSP server availability
-
-            Ok(false) // Default to traditional mode unless explicitly forced
+            info!("Negotiating as traditional RTSP server (pass --client if this sink needs the reverse role)");
+            Ok(false)
         } else {
             // No connection - default to server mode
             Ok(false)
@@ -505,8 +682,21 @@ impl Daemon {
         );
         info!("Our P2P IP: {:?}", local_ip);
 
-        const RTSP_CONNECT_ATTEMPTS: usize = 12;
-        const RTSP_CONNECT_RETRY_DELAY_MS: u64 = 300;
+        // 20 x 500ms = 10s total budget. Previously a connection-refused on
+        // the very first attempt short-circuited straight to the reverse-
+        // listen fallback below, on the assumption that a refusal means
+        // "this GO will never accept an inbound RTSP connection." Confirmed
+        // live against a real LG TV that assumption is wrong: right after
+        // P2P group formation the TV's own screen-share session/UI needs a
+        // few seconds to actually bind its RTSP server, and a connection
+        // attempt in that window gets refused (nothing listening yet) even
+        // though the TV *will* accept one moments later. So connection-
+        // refused is now retried exactly like any other transient error --
+        // the reverse-listen fallback stays, just as what happens after
+        // every attempt in the full budget above has failed, not after the
+        // first refusal.
+        const RTSP_CONNECT_ATTEMPTS: usize = 20;
+        const RTSP_CONNECT_RETRY_DELAY_MS: u64 = 500;
 
         let mut connect_error = None;
         let mut rtsp_client = None;
@@ -517,18 +707,10 @@ impl Daemon {
                     break;
                 }
                 Err(err) => {
-                    if attempt == 1 && Self::is_connection_refused(&err) {
-                        tracing::warn!(
-                            "GO refused RTSP on {}:{}; waiting for reverse RTSP connection",
-                            go_ip,
-                            rtsp_port
-                        );
-                        return self.negotiate_as_reverse_client(&go_ip, rtsp_port).await;
-                    }
-
                     tracing::warn!(
-                        "RTSP connect attempt {} to {}:{} failed: {:?}",
+                        "RTSP connect attempt {}/{} to {}:{} failed: {:?}",
                         attempt,
+                        RTSP_CONNECT_ATTEMPTS,
                         go_ip,
                         rtsp_port,
                         err
@@ -543,14 +725,20 @@ impl Daemon {
             }
         }
 
-        let rtsp_client = rtsp_client.ok_or_else(|| {
-            anyhow::anyhow!(
-                "RTSP client connection failed to {}:{} - {:?}",
-                go_ip,
-                rtsp_port,
-                connect_error
-            )
-        })?;
+        let rtsp_client = match rtsp_client {
+            Some(client) => client,
+            None => {
+                tracing::warn!(
+                    "RTSP client connect to {}:{} did not succeed after {} attempts ({:?}); \
+                     trying a reverse RTSP connection instead",
+                    go_ip,
+                    rtsp_port,
+                    RTSP_CONNECT_ATTEMPTS,
+                    connect_error
+                );
+                return self.negotiate_as_reverse_client(&go_ip, rtsp_port).await;
+            }
+        };
 
         info!("Connected to TV's RTSP server!");
         self.negotiate_with_rtsp_client(rtsp_client).await?;
@@ -558,12 +746,66 @@ impl Daemon {
         Ok(())
     }
 
+    /// Peer address + RTSP port for the listen-then-drive path. Same
+    /// resolution negotiate_as_client does for its outbound dial, factored
+    /// out because the reverse path needs the peer's address too -- not to
+    /// connect to it, but to address the RTSP requests it sends over the
+    /// connection the sink opened.
+    fn reverse_rtsp_target(&self) -> anyhow::Result<(String, u16)> {
+        let conn = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No active connection to sink"))?;
+        let sink = conn.get_sink();
+
+        let go_ip = if let Some(go_ip) = &sink.go_ip_address {
+            go_ip.clone()
+        } else if let Some(our_ip) = &sink.ip_address {
+            let parts: Vec<&str> = our_ip.split('.').collect();
+            if parts.len() == 4 {
+                format!("{}.{}.{}.1", parts[0], parts[1], parts[2])
+            } else {
+                our_ip.clone()
+            }
+        } else {
+            return Err(anyhow::anyhow!("No IP address available"));
+        };
+
+        let rtsp_port = if sink.rtsp_port == 0 {
+            7236
+        } else {
+            sink.rtsp_port
+        };
+
+        Ok((go_ip, rtsp_port))
+    }
+
     async fn negotiate_as_reverse_client(
         &mut self,
         go_ip: &str,
         rtsp_port: u16,
     ) -> anyhow::Result<()> {
-        let bind_addr = format!("0.0.0.0:{}", rtsp_port);
+        // Bind the P2P address specifically, never 0.0.0.0: this listener
+        // hands whoever connects the screen stream, so it must not be
+        // reachable from the ordinary LAN. Falling back to 0.0.0.0 only if
+        // the local P2P address is somehow unknown, which shouldn't happen
+        // once a connection exists.
+        let local_p2p_ip = self
+            .connection
+            .as_ref()
+            .and_then(|conn| conn.get_sink().ip_address.clone());
+
+        let bind_addr = match local_p2p_ip {
+            Some(ref ip) => format!("{}:{}", ip, rtsp_port),
+            None => {
+                warn!(
+                    "Local P2P address unknown; binding reverse RTSP on all interfaces, \
+                     which is reachable from the wider network"
+                );
+                format!("0.0.0.0:{}", rtsp_port)
+            }
+        };
+
         let mut rtsp_client =
             RtspClient::accept_reverse(&bind_addr, go_ip, rtsp_port, Duration::from_secs(15))
                 .await?;
@@ -1534,22 +1776,56 @@ impl Daemon {
         let sink_caps = rtsp_client.send_get_parameter(params_to_request).await?;
         info!("Sink capabilities: {:?}", sink_caps);
 
-        let prefer_hevc = if let Some(codec) = &self.config.video_codec {
-            codec.is_hevc()
-        } else {
-            sink_caps
-                .get("wfd_video_formats")
-                .map(|formats| formats.contains("02"))
-                .unwrap_or(false)
-                && !self.config.extend_mode
-        };
+        // Drop any previous session's selection before choosing again: the
+        // fallback branch below must mean "no mode was selected", not "keep
+        // whatever the last sink agreed to".
+        self.selected_video_mode = None;
 
-        let selected_video_format = sink_caps
-            .get("wfd_video_formats")
-            .map(|formats| {
-                swaybeam_rtsp::WfdCapabilities::select_video_formats(formats, prefer_hevc)
-            })
-            .unwrap_or_else(swaybeam_rtsp::WfdCapabilities::build_video_formats);
+        // Commit to exactly one mode, and to one we can actually produce: the
+        // encoder is already configured for this geometry by the time we get
+        // here, so a selection the pipeline can't honour would just be a
+        // different way of lying to the sink.
+        let selected = sink_caps.get("wfd_video_formats").and_then(|formats| {
+            swaybeam_rtsp::WfdCapabilities::select_video_mode(
+                formats,
+                self.config.video_width,
+                self.config.video_height,
+                self.config.video_framerate,
+            )
+        });
+
+        let selected_video_format = match selected {
+            Some(mode) => {
+                if mode.width != self.config.video_width
+                    || mode.height != self.config.video_height
+                    || mode.framerate != self.config.video_framerate
+                {
+                    info!(
+                        "Sink's best offer is {}x{}p{}, not the {}x{}p{} the capture is \
+                         sized for; the pipeline will scale to the selected mode",
+                        mode.width,
+                        mode.height,
+                        mode.framerate,
+                        self.config.video_width,
+                        self.config.video_height,
+                        self.config.video_framerate
+                    );
+                }
+                let formats = mode.wfd_video_formats.clone();
+                // Remember it: M4 has now promised this exact geometry, and
+                // start_negotiated_stream has to build a pipeline that keeps
+                // the promise rather than one sized from config.
+                self.selected_video_mode = Some(mode);
+                formats
+            }
+            None => {
+                warn!(
+                    "Could not select a video mode from the sink's wfd_video_formats; \
+                     falling back to our own capability string, which the sink may not honour"
+                );
+                swaybeam_rtsp::WfdCapabilities::build_video_formats()
+            }
+        };
 
         info!("Selected video format: {}", selected_video_format);
 
@@ -1583,17 +1859,22 @@ impl Daemon {
             return codec.clone();
         }
 
-        let hevc_supported = sink_caps
-            .get("wfd_video_formats")
-            .map(|formats| formats.contains("02"))
-            .unwrap_or(false);
+        // Ask the parser, not the raw text. This used to be
+        // `formats.contains("02")`, which matches anywhere in the value --
+        // a CEA bitmap of 00000200, a latency field, a max-hres of 0200 --
+        // so a sink advertising no HEVC at all could still be sent an H.265
+        // stream, and one that M4 had just promised H.264 for.
+        let mut caps = swaybeam_rtsp::WfdCapabilities::new();
+        caps.video_formats = sink_caps.get("wfd_video_formats").cloned();
+        let negotiated = caps.negotiate_video_codec();
 
+        let hevc_supported = matches!(negotiated, NegotiatedCodec::H265);
         let prefer_hevc = hevc_supported && !self.config.extend_mode;
 
         let selected = StreamPipeline::select_best_codec(prefer_hevc);
         info!(
-            "Auto-selected codec: {} (HEVC supported by TV: {})",
-            selected, hevc_supported
+            "Auto-selected codec: {} (sink negotiated as {:?})",
+            selected, negotiated
         );
         selected
     }
@@ -1628,14 +1909,40 @@ impl Daemon {
         destination_ip: &str,
         destination_rtp_port: u16,
     ) -> anyhow::Result<()> {
-        let (width, height, bitrate) = if self.config.extend_mode {
-            (3840, 2160, 20_000_000u32)
-        } else {
-            (
+        // Negotiation is, by definition, complete once we're starting the
+        // negotiated stream -- and emitting it here rather than back in
+        // negotiate() is what keeps the event stream in lifecycle order.
+        // negotiate_as_{client,reverse_client,server} each do the RTSP
+        // exchange *and* start the stream, so negotiate()'s post-return
+        // emission landed *after* StreamingStarted below, and a consumer
+        // tracking status would flip streaming -> connecting. Both events
+        // now come from this one place, in the right order.
+        self.event_tx.send(DaemonEvent::Negotiated).ok();
+
+        // Whatever M4 committed to wins. Falling back to the extend-mode
+        // default here would let the source promise the sink one geometry and
+        // send another -- a 720p-only sink would be told 720p and handed
+        // 1080p, which is exactly the sort of mismatch that leaves a TV
+        // showing nothing while every local check looks healthy.
+        let (width, height, framerate, bitrate) = match &self.selected_video_mode {
+            Some(mode) => {
+                let bitrate = if self.config.extend_mode {
+                    10_000_000u32
+                } else {
+                    self.config.video_bitrate
+                };
+                (mode.width, mode.height, mode.framerate, bitrate)
+            }
+            // Must match what run_inner() sized the virtual output to for
+            // extend mode, and what the sink can actually decode -- see the
+            // 1080p rationale there.
+            None if self.config.extend_mode => (1920, 1080, self.config.video_framerate, 10_000_000u32),
+            None => (
                 self.config.video_width,
                 self.config.video_height,
+                self.config.video_framerate,
                 self.config.video_bitrate,
-            )
+            ),
         };
 
         let stream_config = StreamConfig {
@@ -1643,7 +1950,7 @@ impl Daemon {
             video_bitrate: bitrate,
             video_width: width,
             video_height: height,
-            video_framerate: self.config.video_framerate,
+            video_framerate: framerate,
             audio_codec: AudioCodec::AAC,
             audio_bitrate: 128_000,
             audio_sample_rate: 48000,
@@ -1658,6 +1965,20 @@ impl Daemon {
         };
         let mut capture = Capture::new(capture_config)?;
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Arm the portal auto-target as late as possible -- the very next
+        // statement is what triggers the portal request it answers. The
+        // marker is one-shot, so every moment it sits armed is a window in
+        // which some other application's screen-share request consumes it
+        // instead, takes this output, and leaves us at the interactive
+        // picker. Arming it at output-creation time (as this used to) left
+        // that window open across the whole RTSP negotiation.
+        if let Some(ref output) = self.virtual_output {
+            if let Err(e) = output.arm_portal_target() {
+                warn!("Failed to arm the portal auto-target: {}", e);
+            }
+        }
+
         let pw_stream = capture.start().await?;
 
         let audio_monitor = if self.config.enable_audio {
@@ -1686,6 +2007,23 @@ impl Daemon {
         self.capture = Some(capture);
         *self.stream.write().await = Some(pipeline);
         *self.state.write() = DaemonState::Streaming;
+        // Same event start_stream() emits -- this path is the one every
+        // real session actually takes (both negotiate_as_client and
+        // negotiate_as_reverse_client land here), so without it an
+        // external consumer of the event stream sees the session reach
+        // "negotiated" and then nothing, forever, while media is really
+        // flowing. Caught live: the omarchy-wireless-display panel sat on
+        // "Connecting…" through a working, streaming session.
+        self.event_tx.send(DaemonEvent::StreamingStarted).ok();
+
+        // Every negotiated session lands here, so this is the path the
+        // first-frame nudge has to be on. It was originally added only to
+        // start_stream() above -- a fallback path no real Miracast connection
+        // takes -- so it never ran during an ordinary session at all.
+        if let Some(ref output) = self.virtual_output {
+            output.force_repaint();
+        }
+
         Ok(())
     }
 }

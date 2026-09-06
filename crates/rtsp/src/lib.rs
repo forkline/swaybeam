@@ -175,55 +175,33 @@ impl WfdCapabilities {
 }
 
 impl WfdCapabilities {
-    /// Negotiate the best video codec based on sink capabilities
+    /// Negotiate the video codec from the sink's advertised capabilities.
+    ///
+    /// `wfd_video_formats` is an H.264-only parameter: every entry in it
+    /// describes an AVC profile and level. HEVC is advertised separately, in
+    /// WFD 2.0's `wfd2_video_formats`, so its presence -- not some bit inside
+    /// this one -- is what makes H.265 negotiable.
+    ///
+    /// This previously read the field at index 3 as a "codec mask" and tested
+    /// bit 4 for HEVC. On the layout the parameter actually uses, index 3 is
+    /// the H.264 *level*, and level 4.2 is encoded as `10` -- so every sink
+    /// supporting level 4.2 was reported as HEVC-capable. Extend mode masked
+    /// it by forcing H.264 anyway; mirror mode would have sent a real LG TV an
+    /// HEVC stream on the strength of a misread level.
+    /// H.265 is therefore never negotiated here today: enabling it means
+    /// requesting `wfd2_video_formats` in M3 and parsing that, not inspecting
+    /// this parameter harder.
     pub fn negotiate_video_codec(&self) -> NegotiatedCodec {
-        if let Some(formats) = &self.video_formats {
-            let formats_list: Vec<&str> = formats.split(',').map(|s| s.trim()).collect();
-
-            tracing::debug!(
-                "Parsing video formats for codec negotiation: {:?}",
-                formats_list
-            );
-
-            // First pass: check for explicit H.265 codec type "02" (WFD 2.0)
-            for format in &formats_list {
-                if format.starts_with("02 ") {
-                    tracing::debug!(
-                        "Detected H.265/HEVC from explicit codec type '02': {}",
-                        format
-                    );
-                    return NegotiatedCodec::H265;
-                }
+        match self.video_formats.as_deref().map(parse_sink_video_formats) {
+            Some(Some(parsed)) => {
+                tracing::debug!(
+                    "Sink advertises {} H.264 entr{} and no wfd2_video_formats; negotiating H.264",
+                    parsed.entries.len(),
+                    if parsed.entries.len() == 1 { "y" } else { "ies" }
+                );
             }
-
-            // Second pass: check codec mask for H.265 bit in any format
-            // WFD 1.x uses codec mask with bit 4 (0x10) for H.265 support
-            for format in &formats_list {
-                let components: Vec<&str> = format.split_whitespace().collect();
-                if components.len() >= 4 {
-                    if let Ok(mask) = u64::from_str_radix(components[3], 16) {
-                        tracing::debug!(
-                            "Checking codec mask in format '{}': mask={}",
-                            format,
-                            mask
-                        );
-                        if (mask & 0x0000000000000010) != 0 {
-                            tracing::debug!("Codec mask indicates H.265 support");
-                            return NegotiatedCodec::H265;
-                        }
-                    }
-                }
-            }
-
-            // Third pass: check for H.264 codec types "01" or "40"
-            for format in &formats_list {
-                if format.starts_with("01 ") || format.starts_with("40 ") {
-                    tracing::debug!("Detected H.264/AVC from codec type: {}", format);
-                    return NegotiatedCodec::H264;
-                }
-            }
+            _ => tracing::warn!("No usable video format advertised, defaulting to H.264"),
         }
-        tracing::warn!("No video format detected, defaulting to H.264");
         NegotiatedCodec::H264
     }
 
@@ -239,39 +217,99 @@ impl WfdCapabilities {
         }
     }
 
+    /// The source's own `wfd_video_formats`, used when a sink advertises
+    /// nothing we can parse.
+    ///
+    /// This was `"01 01 00 0000000000000017"`, which is not a well-formed
+    /// value at all -- four fields where the parameter takes thirteen. Nothing
+    /// caught it because the old parser only ever indexed fields 0-3. It now
+    /// says what it means: native 1920x1080p30 (CEA index 7), constrained
+    /// baseline, level 4.0, and CEA bit 7 as the single offered mode.
     pub fn build_video_formats() -> String {
-        "01 01 00 0000000000000017".to_string()
+        "38 00 01 04 00000080 00000000 00000000 00 0000 0000 00 none none".to_string()
     }
 
-    pub fn select_video_formats(sink_formats: &str, prefer_hevc: bool) -> String {
-        let formats: Vec<&str> = sink_formats.split(',').map(|s| s.trim()).collect();
+    /// Choose the single video mode to stream, and render the M4
+    /// `wfd_video_formats` line that names exactly that mode.
+    ///
+    /// M4 is a *selection*, not a capability list. The spec requires exactly
+    /// one bit set across the CEA/VESA/HH bitmaps, telling the sink the one
+    /// format the source will actually produce. Echoing the sink's own bitmap
+    /// straight back -- which this used to do -- says "I might send any of
+    /// these", leaving the sink to guess the geometry of what arrives.
+    ///
+    /// Returns `None` when the sink advertises nothing we can produce, in
+    /// which case the caller should fall back rather than send a bogus M4.
+    pub fn select_video_mode(
+        sink_formats: &str,
+        max_width: u32,
+        max_height: u32,
+        max_framerate: u32,
+    ) -> Option<SelectedVideoMode> {
+        let parsed = parse_sink_video_formats(sink_formats)?;
 
-        tracing::debug!("Parsing video formats for selection: {:?}", formats);
+        // Every advertised codec entry is a candidate, not just the first: a
+        // sink may list a constrained-baseline entry and a high-profile one,
+        // and the later entry can be the only one whose level reaches the
+        // resolution we want.
+        let mut best: Option<(u32, u32, &SinkCodecEntry, &WfdMode, u32, u32)> = None;
 
-        // H.265/HEVC has codec type "02" (WFD 2.0)
-        let h265_format = formats.iter().find(|f| f.starts_with("02 "));
-        // H.264/AVC has codec types "01" (WFD 1.0) or "40" (H.264 SVC)
-        let h264_format = formats
-            .iter()
-            .find(|f| f.starts_with("01 ") || f.starts_with("40 "));
+        for entry in &parsed.entries {
+            for mode in CEA_MODES
+                .iter()
+                // Progressive only -- there is no interlaced encoder path --
+                // and never larger or faster than what we actually produce.
+                .filter(|m| !m.interlaced)
+                .filter(|m| entry.cea & (1u32 << m.bit) != 0)
+                .filter(|m| {
+                    m.width <= max_width && m.height <= max_height && m.framerate <= max_framerate
+                })
+            {
+                // A level is not a free choice. Picking the lowest bit the
+                // sink advertises can name a level that cannot legally carry
+                // the resolution being selected -- level 3.1 tops out at 3600
+                // macroblocks, so it cannot describe 1080p at all -- which
+                // makes the M4 self-contradictory.
+                let Some(level) = lowest_sufficient_level(entry.level, mode) else {
+                    continue;
+                };
+                let Some(profile) = preferred_profile(entry.profile) else {
+                    continue;
+                };
+                let score = (mode.width * mode.height, mode.framerate);
 
-        tracing::debug!("Found H.264 format: {:?}", h264_format);
-        tracing::debug!("Found H.265 format: {:?}", h265_format);
-
-        if prefer_hevc {
-            if let Some(h265) = h265_format {
-                tracing::info!("Selected H.265 format from TV: {}", h265);
-                return h265.to_string();
+                if best.is_none_or(|(w, f, ..)| score > (w, f)) {
+                    best = Some((score.0, score.1, entry, mode, profile, level));
+                }
             }
         }
 
-        if let Some(h264) = h264_format {
-            tracing::info!("Selected H.264 format from TV: {}", h264);
-            return h264.to_string();
-        }
+        let (_, _, entry, mode, profile, level) = best?;
 
-        tracing::warn!("No matching format found, using capabilities string");
-        Self::build_video_formats()
+        let selected = SelectedVideoMode {
+            width: mode.width,
+            height: mode.height,
+            framerate: mode.framerate,
+            wfd_video_formats: format!(
+                "{} {} {:02X} {:02X} {:08X} 00000000 00000000 {}",
+                parsed.native,
+                parsed.preferred_display_mode,
+                profile,
+                level,
+                1u32 << mode.bit,
+                entry.tail.join(" ")
+            ),
+        };
+
+        tracing::info!(
+            "Selected video mode {}x{}p{} (CEA bit {}); M4 = {}",
+            selected.width,
+            selected.height,
+            selected.framerate,
+            mode.bit,
+            selected.wfd_video_formats
+        );
+        Some(selected)
     }
 
     pub fn build_audio_codecs() -> String {
@@ -279,6 +317,188 @@ impl WfdCapabilities {
         // Format: "codec cap1 cap2" where cap1 is caps bitmap, cap2 is latency
         "AAC 00000001 00".to_string()
     }
+}
+
+/// One row of a WFD resolution table: the bit that selects it in the matching
+/// support bitmap, and the geometry that bit stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WfdMode {
+    pub bit: u8,
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    pub interlaced: bool,
+}
+
+macro_rules! cea {
+    ($bit:expr, $w:expr, $h:expr, $fps:expr, $il:expr) => {
+        WfdMode {
+            bit: $bit,
+            width: $w,
+            height: $h,
+            framerate: $fps,
+            interlaced: $il,
+        }
+    };
+}
+
+/// The CEA resolution/refresh table (Wi-Fi Display spec, Table 5-13). Bit
+/// positions index the "CEA Support" field of `wfd_video_formats`.
+pub const CEA_MODES: &[WfdMode] = &[
+    cea!(0, 640, 480, 60, false),
+    cea!(1, 720, 480, 60, false),
+    cea!(2, 720, 480, 60, true),
+    cea!(3, 720, 576, 50, false),
+    cea!(4, 720, 576, 50, true),
+    cea!(5, 1280, 720, 30, false),
+    cea!(6, 1280, 720, 60, false),
+    cea!(7, 1920, 1080, 30, false),
+    cea!(8, 1920, 1080, 60, false),
+    cea!(9, 1920, 1080, 60, true),
+    cea!(10, 1280, 720, 25, false),
+    cea!(11, 1280, 720, 50, false),
+    cea!(12, 1920, 1080, 25, false),
+    cea!(13, 1920, 1080, 50, false),
+    cea!(14, 1920, 1080, 50, true),
+    cea!(15, 1280, 720, 24, false),
+    cea!(16, 1920, 1080, 24, false),
+];
+
+/// Number of whitespace-separated fields in one codec entry of
+/// `wfd_video_formats`.
+const WFD_ENTRY_FIELDS: usize = 11;
+
+/// A `wfd_video_formats` value as a sink sends it in M3.
+///
+/// The layout is `<native> <preferred-display-mode-supported>` followed by one
+/// or more comma-separated codec entries of eleven fields each:
+/// `<profile> <level> <CEA> <VESA> <HH> <latency> <min-slice-size>
+/// <slice-enc-params> <frame-rate-control> <max-hres> <max-vres>`.
+///
+/// Getting this layout wrong is easy and quiet. A real LG sink sends
+/// `40 00 01 10 000194FF 155575DF 00000555 00 0000 0000 1F none none`, where
+/// the leading `40` is the *native mode*, not a codec tag, and the `10` at
+/// index 3 is the H.264 *level* (4.2), not a codec bitmask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkVideoFormats {
+    pub native: String,
+    pub preferred_display_mode: String,
+    pub entries: Vec<SinkCodecEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkCodecEntry {
+    pub profile: u32,
+    pub level: u32,
+    pub cea: u32,
+    pub vesa: u32,
+    pub hh: u32,
+    /// latency, min-slice-size, slice-enc-params, frame-rate-control,
+    /// max-hres and max-vres -- carried through to M4 unchanged.
+    pub tail: Vec<String>,
+}
+
+/// The one mode the source commits to in M4, plus the geometry it implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedVideoMode {
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    /// The M4 `wfd_video_formats` line naming exactly this one mode.
+    pub wfd_video_formats: String,
+}
+
+pub fn parse_sink_video_formats(value: &str) -> Option<SinkVideoFormats> {
+    let mut chunks = value.split(',').map(|chunk| chunk.trim());
+
+    let first: Vec<&str> = chunks.next()?.split_whitespace().collect();
+    if first.len() < 2 + WFD_ENTRY_FIELDS {
+        tracing::warn!(
+            "wfd_video_formats has {} fields, expected at least {}: {:?}",
+            first.len(),
+            2 + WFD_ENTRY_FIELDS,
+            value
+        );
+        return None;
+    }
+
+    let mut entries = vec![parse_codec_entry(&first[2..])?];
+    for chunk in chunks {
+        let fields: Vec<&str> = chunk.split_whitespace().collect();
+        if let Some(entry) = parse_codec_entry(&fields) {
+            entries.push(entry);
+        }
+    }
+
+    Some(SinkVideoFormats {
+        native: first[0].to_string(),
+        preferred_display_mode: first[1].to_string(),
+        entries,
+    })
+}
+
+fn parse_codec_entry(fields: &[&str]) -> Option<SinkCodecEntry> {
+    if fields.len() < WFD_ENTRY_FIELDS {
+        return None;
+    }
+    Some(SinkCodecEntry {
+        profile: u32::from_str_radix(fields[0], 16).ok()?,
+        level: u32::from_str_radix(fields[1], 16).ok()?,
+        cea: u32::from_str_radix(fields[2], 16).ok()?,
+        vesa: u32::from_str_radix(fields[3], 16).ok()?,
+        hh: u32::from_str_radix(fields[4], 16).ok()?,
+        tail: fields[5..WFD_ENTRY_FIELDS]
+            .iter()
+            .map(|field| field.to_string())
+            .collect(),
+    })
+}
+
+/// H.264 levels as the WFD "level" bitmap orders them, each with the limits
+/// that decide whether it can legally carry a given mode: `max_frame_mbs` is
+/// MaxFS and `max_mbps` is MaxMBPS from Annex A of the H.264 spec.
+const H264_LEVELS: &[(u32, u32, u32)] = &[
+    // bit, MaxFS (macroblocks per frame), MaxMBPS (macroblocks per second)
+    (0, 3600, 108_000),  // 3.1
+    (1, 5120, 216_000),  // 3.2
+    (2, 8192, 245_760),  // 4.0
+    (3, 8192, 245_760),  // 4.1
+    (4, 8704, 522_240),  // 4.2
+];
+
+/// WFD profile bitmap: bit 0 is Constrained Baseline, bit 1 Constrained High.
+const WFD_PROFILE_CBP: u32 = 1 << 0;
+
+/// The lowest level the sink advertises that can actually describe `mode`,
+/// as a single-bit mask ready for M4.
+///
+/// Taking the lowest advertised bit unconditionally is wrong: a sink offering
+/// levels 3.1, 4.0 and 4.2 would be told 3.1 alongside a 1080p selection, and
+/// 3.1 caps out at 3600 macroblocks per frame -- less than half of 1080p's
+/// 8160 -- so the two halves of the M4 would contradict each other.
+fn lowest_sufficient_level(advertised: u32, mode: &WfdMode) -> Option<u32> {
+    let frame_mbs = mode.width.div_ceil(16) * mode.height.div_ceil(16);
+    let mbps = frame_mbs * mode.framerate;
+
+    H264_LEVELS
+        .iter()
+        .filter(|(bit, ..)| advertised & (1u32 << bit) != 0)
+        .find(|(_, max_frame_mbs, max_mbps)| frame_mbs <= *max_frame_mbs && mbps <= *max_mbps)
+        .map(|(bit, ..)| 1u32 << bit)
+}
+
+/// The profile to name in M4, as a single-bit mask, or `None` when the sink
+/// accepts nothing this source can produce.
+///
+/// The encoder is fixed to constrained baseline. Naming any other profile
+/// would describe a stream we never send, so an entry that omits CBP is not a
+/// usable entry -- previously this fell back to the lowest advertised bit,
+/// announcing e.g. constrained high while still emitting constrained
+/// baseline. Rejecting lets selection try the sink's other entries, and
+/// failing that fall back to our own capability string, which does advertise
+/// what we actually produce.
+fn preferred_profile(advertised: u32) -> Option<u32> {
+    (advertised & WFD_PROFILE_CBP != 0).then_some(WFD_PROFILE_CBP)
 }
 
 /// Parse the RTP destination port from a `wfd_client_rtp_ports` value.
@@ -954,6 +1174,30 @@ struct PeerRequestOutcome {
     idr_requested: bool,
 }
 
+/// Whether a peer that just connected can plausibly be the sink: either it
+/// is exactly the address we derived for it, or it shares that address's
+/// /24 (the P2P group's own subnet). Loopback is allowed so tests can drive
+/// this over 127.0.0.1.
+///
+/// This is a sanity check, not the security boundary -- binding the
+/// listener to the P2P address is. It catches the case where something else
+/// inside the group races the sink to the accept.
+fn peer_is_plausible_sink(peer_ip: &str, expected_ip: &str) -> bool {
+    if peer_ip == expected_ip || peer_ip == "127.0.0.1" {
+        return true;
+    }
+
+    let subnet = |ip: &str| {
+        let octets: Vec<&str> = ip.split('.').collect();
+        (octets.len() == 4).then(|| octets[..3].join("."))
+    };
+
+    match (subnet(peer_ip), subnet(expected_ip)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 impl RtspClient {
     fn from_stream(server_addr: String, stream: TcpStream) -> Result<Self, RtspError> {
         stream.set_nodelay(true).map_err(RtspError::Io)?;
@@ -1022,24 +1266,64 @@ impl RtspClient {
         let listener = TcpListener::bind(bind_addr).await?;
         tracing::info!("Waiting for reverse RTSP connection on {}", bind_addr);
 
-        let (stream, peer_addr) = tokio::time::timeout(timeout, listener.accept())
-            .await
-            .map_err(|_| RtspError::Timeout)??;
+        // Accept in a loop, rejecting anything that isn't plausibly the
+        // sink. Two layers, because trusting the peer address (necessary --
+        // see below) is only safe if we also control who can reach us:
+        //
+        //  1. The caller binds to the local P2P address, not 0.0.0.0, so
+        //     hosts on the ordinary LAN can't reach this listener at all.
+        //  2. Even within the P2P group, the peer must match the address we
+        //     expect, or at least share its /24. Without this, any host that
+        //     wins a race during the accept window would be handed the
+        //     screen stream.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (stream, peer_addr) = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(RtspError::Timeout);
+            }
+
+            let (stream, peer_addr) = tokio::time::timeout(remaining, listener.accept())
+                .await
+                .map_err(|_| RtspError::Timeout)??;
+
+            if peer_is_plausible_sink(&peer_addr.ip().to_string(), server_ip) {
+                break (stream, peer_addr);
+            }
+
+            tracing::warn!(
+                "Rejecting reverse RTSP connection from {}: not the expected sink ({}) \
+                 nor on its subnet",
+                peer_addr,
+                server_ip
+            );
+            drop(stream);
+        };
+
         tracing::info!(
             "Accepted reverse RTSP connection from {} on {}",
             peer_addr,
             bind_addr
         );
 
-        if peer_addr.ip().to_string() != server_ip {
-            tracing::warn!(
-                "Reverse RTSP peer IP {} did not match expected sink IP {}",
-                peer_addr.ip(),
+        // Trust the accepted connection's peer address over the caller's
+        // guess. `server_ip` is derived from the P2P subnet's .1 address,
+        // which is the sink only when the *sink* is group owner -- when the
+        // source is GO, .1 is us, and every address derived from it
+        // (notably PeerPlayInfo.dest_ip) points the RTP stream back at the
+        // local machine instead of the TV. The peer that just connected is
+        // the sink -- now that the checks above establish it plausibly is.
+        let peer_ip = peer_addr.ip().to_string();
+        if peer_ip != server_ip {
+            tracing::info!(
+                "Reverse RTSP peer {} differs from the derived sink address {}; \
+                 using the peer address (the connection came from there)",
+                peer_ip,
                 server_ip
             );
         }
 
-        Self::from_stream(format!("{}:{}", server_ip, server_port), stream)
+        Self::from_stream(format!("{}:{}", peer_ip, server_port), stream)
     }
 
     fn control_uri(&self) -> String {
@@ -2146,6 +2430,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peer_validation_accepts_the_sink_and_its_group() {
+        // Exactly the expected sink.
+        assert!(peer_is_plausible_sink("192.168.49.1", "192.168.49.1"));
+        // Another member of the same P2P group -- the source may be GO, in
+        // which case the sink is some other address on this subnet.
+        assert!(peer_is_plausible_sink("192.168.49.23", "192.168.49.1"));
+        // Loopback, so tests can drive accept_reverse over 127.0.0.1.
+        assert!(peer_is_plausible_sink("127.0.0.1", "192.168.49.1"));
+    }
+
+    #[test]
+    fn peer_validation_rejects_hosts_outside_the_group() {
+        // The whole point: a host on the ordinary LAN racing the TV to the
+        // accept window must not be handed the screen stream.
+        assert!(!peer_is_plausible_sink("192.168.1.119", "192.168.49.1"));
+        assert!(!peer_is_plausible_sink("10.0.0.5", "192.168.49.1"));
+        assert!(!peer_is_plausible_sink("192.168.50.1", "192.168.49.1"));
+        // Garbage in shouldn't read as a match.
+        assert!(!peer_is_plausible_sink("", "192.168.49.1"));
+        assert!(!peer_is_plausible_sink("not-an-ip", "192.168.49.1"));
+    }
+
+    #[test]
     fn test_wfd_capabilities() {
         let mut caps = WfdCapabilities::new();
         caps.set_parameter(
@@ -2208,11 +2515,161 @@ mod tests {
         assert_eq!(caps.negotiate_video_codec(), NegotiatedCodec::H264);
     }
 
+    /// `wfd_video_formats` from a real LG webOS TV (OLED55B9PLA).
+    const LG_SINK_FORMATS: &str =
+        "40 00 01 10 000194FF 155575DF 00000555 00 0000 0000 1F none none";
+
+    /// This used to assert H265, which is what the old code returned -- it
+    /// read field 3 as a "codec mask" and tested bit 4. Field 3 is the H.264
+    /// level, and 4.2 is encoded as `10`, so every sink supporting level 4.2
+    /// was reported HEVC-capable. `wfd_video_formats` describes H.264 only;
+    /// HEVC lives in WFD 2.0's `wfd2_video_formats`, which we never request.
     #[test]
-    fn test_codec_negotiation_h265() {
+    fn h264_is_negotiated_from_a_real_sink_advertising_level_4_2() {
         let mut caps = WfdCapabilities::new();
-        caps.video_formats = Some("01 01 00 000000000000001F".to_string());
-        assert_eq!(caps.negotiate_video_codec(), NegotiatedCodec::H265);
+        caps.video_formats = Some(LG_SINK_FORMATS.to_string());
+        assert_eq!(caps.negotiate_video_codec(), NegotiatedCodec::H264);
+    }
+
+    #[test]
+    fn sink_video_formats_parse_into_their_documented_fields() {
+        let parsed = parse_sink_video_formats(LG_SINK_FORMATS).expect("should parse");
+        assert_eq!(parsed.native, "40");
+        assert_eq!(parsed.preferred_display_mode, "00");
+        assert_eq!(parsed.entries.len(), 1);
+
+        let entry = &parsed.entries[0];
+        assert_eq!(entry.profile, 0x01);
+        assert_eq!(entry.level, 0x10);
+        assert_eq!(entry.cea, 0x000194FF);
+        assert_eq!(entry.vesa, 0x155575DF);
+        assert_eq!(entry.hh, 0x00000555);
+        assert_eq!(entry.tail, vec!["00", "0000", "0000", "1F", "none", "none"]);
+    }
+
+    /// The whole point of M4: one bit, not the sink's whole bitmap echoed back.
+    #[test]
+    fn selected_mode_names_exactly_one_resolution() {
+        let selected = WfdCapabilities::select_video_mode(LG_SINK_FORMATS, 1920, 1080, 30)
+            .expect("1080p30 is advertised");
+
+        assert_eq!((selected.width, selected.height, selected.framerate), (1920, 1080, 30));
+        assert_eq!(
+            selected.wfd_video_formats,
+            "40 00 01 10 00000080 00000000 00000000 00 0000 0000 1F none none"
+        );
+
+        let cea = selected
+            .wfd_video_formats
+            .split_whitespace()
+            .nth(4)
+            .and_then(|field| u32::from_str_radix(field, 16).ok())
+            .expect("CEA field");
+        assert_eq!(cea.count_ones(), 1, "M4 must select a single mode");
+    }
+
+    /// The sink advertises 1080p at 30/25/24 but not 60, so a 60fps cap must
+    /// not silently promise the sink something it never offered.
+    #[test]
+    fn selection_never_exceeds_what_the_sink_advertises() {
+        let selected = WfdCapabilities::select_video_mode(LG_SINK_FORMATS, 3840, 2160, 60)
+            .expect("something is advertised");
+        assert_eq!((selected.width, selected.height, selected.framerate), (1920, 1080, 30));
+    }
+
+    /// A sink offering levels 3.1, 4.0 and 4.2 (bits 0, 2, 4) must not be
+    /// told 3.1 alongside a 1080p selection: 3.1 caps at 3600 macroblocks per
+    /// frame and 1080p needs 8160, so the M4 would contradict itself.
+    #[test]
+    fn selected_level_can_actually_carry_the_selected_resolution() {
+        let formats = "38 00 01 15 00000080 00000000 00000000 00 0000 0000 1F none none";
+        let selected =
+            WfdCapabilities::select_video_mode(formats, 1920, 1080, 30).expect("1080p30 offered");
+
+        let level = selected
+            .wfd_video_formats
+            .split_whitespace()
+            .nth(3)
+            .and_then(|f| u32::from_str_radix(f, 16).ok())
+            .expect("level field");
+        assert_eq!(level, 1 << 2, "level 4.0, not the lowest advertised 3.1");
+    }
+
+    /// 720p30 fits inside level 3.1, so there is no reason to claim more.
+    #[test]
+    fn selected_level_is_the_lowest_that_suffices() {
+        let formats = "28 00 01 15 00000020 00000000 00000000 00 0000 0000 1F none none";
+        let selected =
+            WfdCapabilities::select_video_mode(formats, 1920, 1080, 30).expect("720p30 offered");
+
+        assert_eq!((selected.width, selected.height), (1280, 720));
+        let level = selected
+            .wfd_video_formats
+            .split_whitespace()
+            .nth(3)
+            .and_then(|f| u32::from_str_radix(f, 16).ok())
+            .expect("level field");
+        assert_eq!(level, 1 << 0, "level 3.1 is enough for 720p30");
+    }
+
+    /// Only the first codec entry used to be considered, so a sink whose
+    /// later entry carried the better mode was capped at its first.
+    #[test]
+    fn selection_considers_every_codec_entry() {
+        // Both entries are constrained baseline; only the second reaches
+        // 1080p30 (CEA bit 7, level 4.0).
+        let formats = "38 00 01 01 00000020 00000000 00000000 00 0000 0000 1F none none, \
+                       01 04 00000080 00000000 00000000 00 0000 0000 1F none none";
+        let selected = WfdCapabilities::select_video_mode(formats, 1920, 1080, 30)
+            .expect("second entry offers 1080p30");
+
+        assert_eq!(
+            (selected.width, selected.height, selected.framerate),
+            (1920, 1080, 30),
+            "the better mode lives in the second entry"
+        );
+    }
+
+    /// A sink whose only advertised level cannot carry any mode it lists is
+    /// self-contradictory; better to fall back than to echo the nonsense.
+    #[test]
+    fn selection_rejects_modes_no_advertised_level_can_carry() {
+        let formats = "38 00 01 01 00000080 00000000 00000000 00 0000 0000 1F none none";
+        assert!(WfdCapabilities::select_video_mode(formats, 1920, 1080, 30).is_none());
+    }
+
+    /// The encoder only emits constrained baseline, so an entry offering
+    /// just constrained high is unusable -- claiming it in M4 would describe
+    /// a stream we never send.
+    #[test]
+    fn entries_without_constrained_baseline_are_rejected() {
+        let chp_only = "38 00 02 04 00000080 00000000 00000000 00 0000 0000 1F none none";
+        assert!(WfdCapabilities::select_video_mode(chp_only, 1920, 1080, 30).is_none());
+    }
+
+    /// ...but it should still fall through to a later entry that does offer
+    /// constrained baseline, rather than giving up on the sink.
+    #[test]
+    fn selection_skips_unusable_entries_and_keeps_looking() {
+        let formats = "38 00 02 04 00000080 00000000 00000000 00 0000 0000 1F none none, \
+                       01 04 00000020 00000000 00000000 00 0000 0000 1F none none";
+        let selected = WfdCapabilities::select_video_mode(formats, 1920, 1080, 30)
+            .expect("second entry is constrained baseline");
+
+        assert_eq!((selected.width, selected.height), (1280, 720));
+        let profile = selected
+            .wfd_video_formats
+            .split_whitespace()
+            .nth(2)
+            .and_then(|f| u32::from_str_radix(f, 16).ok())
+            .expect("profile field");
+        assert_eq!(profile, 0x01, "constrained baseline, what the encoder emits");
+    }
+
+    #[test]
+    fn selection_falls_back_when_nothing_fits() {
+        assert!(WfdCapabilities::select_video_mode(LG_SINK_FORMATS, 320, 240, 30).is_none());
+        assert!(WfdCapabilities::select_video_mode("garbage", 1920, 1080, 30).is_none());
     }
 
     #[test]

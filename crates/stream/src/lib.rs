@@ -586,51 +586,64 @@ impl StreamPipelineInner {
         };
 
         let video_mux_pad = "sink_4113";
-        let pipeline_str = if audio_branch.is_empty() {
-            format!(
-                "mpegtsmux name=mux alignment=7 \
-                 ! queue name=queue-pre-payloader max-size-buffers=1 \
-                 ! {} name=pay0 ssrc=1 perfect-rtptime=false timestamp-offset=0 seqnum-offset=0 \
-                 ! udpsink name=udpsink host=127.0.0.1 port=5004 sync=false async=false \
-                 pipewiresrc name=videosrc fd={} target-object=xdg-desktop-portal-wlr keepalive-time=1000 always-copy=true do-timestamp=true \
-                 ! videoconvert \
-                 ! {} name=enc {} \
-                 ! {} name=parser config-interval=-1 \
-                 ! {} \
-                 ! queue name=queue-mux-video max-size-buffers=1000 max-size-time=500000000 \
-                 ! mux.{}",
-                config.video_codec.rtp_payloader(),
-                fd,
-                config.video_codec.gstreamer_encoder(),
-                encoder_props,
-                config.video_codec.parser(),
-                caps_str,
-                video_mux_pad
-            )
-        } else {
-            format!(
-                "mpegtsmux name=mux alignment=7 \
-                 ! queue name=queue-pre-payloader max-size-buffers=1 \
-                 ! {} name=pay0 ssrc=1 perfect-rtptime=false timestamp-offset=0 seqnum-offset=0 \
-                 ! udpsink name=udpsink host=127.0.0.1 port=5004 sync=false async=false \
-                 pipewiresrc name=videosrc fd={} target-object=xdg-desktop-portal-wlr keepalive-time=1000 always-copy=true do-timestamp=true \
-                 ! videoconvert \
-                 ! {} name=enc {} \
-                 ! {} name=parser config-interval=-1 \
-                 ! {} \
-                 ! queue name=queue-mux-video max-size-buffers=1000 max-size-time=500000000 \
-                 ! mux.{} \
-                 {}",
-                config.video_codec.rtp_payloader(),
-                fd,
-                config.video_codec.gstreamer_encoder(),
-                encoder_props,
-                config.video_codec.parser(),
-                caps_str,
-                video_mux_pad,
-                audio_branch
-            )
-        };
+
+        // imagefreeze is what keeps the sink fed.
+        //
+        // Hyprland emits a screencopy frame only when the output is damaged,
+        // and a freshly created virtual monitor with nothing on it is never
+        // damaged. Measured against the real TV: exactly one frame at startup,
+        // then 30+ seconds of total silence from pipewiresrc, then a burst the
+        // moment a window landed on that output. Audio kept flowing through the
+        // same muxer the whole time, which is what makes the failure so
+        // confusing -- the session looks completely healthy while the sink has
+        // no video stream to lock onto, so the TV sits on a spinner.
+        //
+        // allow-replace=true swaps in each genuinely new frame as it arrives;
+        // is-live=true keeps re-pushing the most recent one at the negotiated
+        // rate in between. The sink therefore always has a stream, whether or
+        // not anything on the desktop is moving.
+        //
+        // It sits *after* videoconvert deliberately: conversion then runs only
+        // on real frames rather than on all 30 repeats a second.
+        // videoscale, and width/height in the caps, because the capture is
+        // sized to the virtual output while the encoder must produce exactly
+        // the mode M4 committed to. Those coincide in the common case and
+        // diverge whenever a sink's best offer is below the virtual output --
+        // constraining only the framerate there would send a 1080p stream to a
+        // sink that had just been promised 720p.
+        let video_branch = format!(
+            "pipewiresrc name=videosrc fd={} path={} keepalive-time=1000 always-copy=true do-timestamp=true \
+             ! videoconvert \
+             ! videoscale \
+             ! imagefreeze name=framerepeat allow-replace=true is-live=true \
+             ! video/x-raw,width={},height={},framerate={}/1 \
+             ! {} name=enc {} \
+             ! {} name=parser config-interval=-1 \
+             ! {} \
+             ! queue name=queue-mux-video max-size-buffers=1000 max-size-time=500000000 \
+             ! mux.{}",
+            fd,
+            node_id,
+            config.video_width,
+            config.video_height,
+            config.video_framerate,
+            config.video_codec.gstreamer_encoder(),
+            encoder_props,
+            config.video_codec.parser(),
+            caps_str,
+            video_mux_pad
+        );
+
+        let pipeline_str = format!(
+            "mpegtsmux name=mux alignment=7 \
+             ! queue name=queue-pre-payloader max-size-buffers=1 \
+             ! {} name=pay0 ssrc=1 perfect-rtptime=false timestamp-offset=0 seqnum-offset=0 \
+             ! udpsink name=udpsink host=127.0.0.1 port=5004 sync=false async=false \
+             {} {}",
+            config.video_codec.rtp_payloader(),
+            video_branch,
+            audio_branch
+        );
 
         tracing::info!("Pipeline string: {}", pipeline_str);
 
