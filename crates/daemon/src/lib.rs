@@ -528,6 +528,16 @@ impl Daemon {
         info!("Stream pipeline started");
         self.event_tx.send(DaemonEvent::StreamingStarted).ok();
 
+        // The pipeline is live but the compositor has no reason to draw an
+        // untouched virtual output, so nudge it. This has to happen *after*
+        // the pipeline is running -- a frame produced before then is simply
+        // missed, and we are back to waiting for something incidental to
+        // damage the output. The second nudge covers the case where the
+        // first raced the capture's own start-up.
+        if let Some(ref output) = self.virtual_output {
+            output.force_repaint();
+        }
+
         Ok(())
     }
 
@@ -2005,6 +2015,14 @@ impl Daemon {
         // flowing. Caught live: the omarchy-wireless-display panel sat on
         // "Connecting…" through a working, streaming session.
         self.event_tx.send(DaemonEvent::StreamingStarted).ok();
+
+        // Every negotiated session lands here, so this is the path the
+        // first-frame nudge has to be on. It was originally added only to
+        // start_stream() above -- a fallback path no real Miracast connection
+        // takes -- so it never ran during an ordinary session at all.
+        if let Some(ref output) = self.virtual_output {
+            output.force_repaint();
+        }
 
         Ok(())
     }

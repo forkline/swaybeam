@@ -229,6 +229,38 @@ impl VirtualOutput {
         }
     }
 
+    /// Force the compositor to render this output once.
+    ///
+    /// wlroots compositors only produce a screencopy frame when an output is
+    /// damaged, and a virtual output that was just created, has no windows on
+    /// it and nothing moving is never damaged. The capture source therefore
+    /// sits at zero frames indefinitely and the sink has no stream to lock
+    /// onto -- measured against a real TV: 35 seconds of audio-only silence
+    /// after the pipeline reached PLAYING, ending only when something
+    /// incidental finally touched the output.
+    ///
+    /// Re-applying the monitor's own configuration is enough to make Hyprland
+    /// repaint it. Measured: video began flowing 1.1s after this call, where
+    /// it had otherwise not started at all.
+    ///
+    /// Best-effort by design -- a failure here costs a slow first frame, not
+    /// a broken session, so it warns rather than propagating.
+    pub fn force_repaint(&self) {
+        if self.backend != Backend::Hyprland {
+            return;
+        }
+        hyprland::force_repaint(&self.output_name);
+
+        // Nudge again shortly after. The first one can land while the capture
+        // is still attaching, in which case the frame it produces goes
+        // nowhere and the output falls quiet again.
+        let name = self.output_name.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            hyprland::force_repaint(&name);
+        });
+    }
+
     pub fn output_name(&self) -> &str {
         &self.output_name
     }
@@ -857,6 +889,72 @@ mod hyprland {
     // Warn-only, like the Sway backend's disable_output: cleanup must not
     // abort partway through and skip the portal-config restore below it
     // just because the compositor is already gone (e.g. session ending).
+    /// The parts of a monitor's live configuration a repaint has to put back
+    /// exactly as it found them.
+    struct MonitorConfig {
+        mode: String,
+        position: String,
+        scale: String,
+    }
+
+    fn current_monitor_config(json: &serde_json::Value, name: &str) -> Option<MonitorConfig> {
+        json.as_array()?.iter().find_map(|m| {
+            if m.get("name")?.as_str()? != name {
+                return None;
+            }
+            let refresh = m.get("refreshRate")?.as_f64()?;
+            Some(MonitorConfig {
+                mode: format!(
+                    "{}x{}@{:.5}",
+                    m.get("width")?.as_u64()?,
+                    m.get("height")?.as_u64()?,
+                    refresh
+                ),
+                position: format!("{}x{}", m.get("x")?.as_i64()?, m.get("y")?.as_i64()?),
+                scale: format!("{}", m.get("scale")?.as_f64()?),
+            })
+        })
+    }
+
+    /// Re-apply an output's *current* configuration to make Hyprland repaint
+    /// it. See `VirtualOutput::force_repaint` for why this is needed at all.
+    ///
+    /// Reading the live config first matters: an earlier version hardcoded
+    /// `position = "auto", scale = 1`, which quietly reset anything the user
+    /// or the shell had arranged since the output appeared. Confirmed on a
+    /// scratch output that Hyprland had auto-scaled to 1.25 -- the nudge
+    /// dropped it to 1. Re-applying what is already set is enough to trigger
+    /// the repaint without changing anything.
+    pub(super) fn force_repaint(name: &str) {
+        let config = match hyprctl_json(&["monitors", "all", "-j"])
+            .ok()
+            .and_then(|json| current_monitor_config(&json, name))
+        {
+            Some(config) => config,
+            None => {
+                tracing::warn!(
+                    "Could not read '{name}' configuration; skipping repaint nudge \
+                     rather than risk applying a different one"
+                );
+                return;
+            }
+        };
+
+        let lua = format!(
+            "hl.monitor({{output = \"{name}\", mode = \"{}\", position = \"{}\", scale = {}}})",
+            config.mode, config.position, config.scale
+        );
+        match Command::new("hyprctl").args(["eval", &lua]).output() {
+            Ok(out) if out.status.success() => tracing::debug!("Nudged '{name}' to repaint"),
+            Ok(out) => tracing::warn!(
+                "Repaint nudge for '{name}' failed; first frame may be slow: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => tracing::warn!("Could not run hyprctl to nudge '{name}': {e}"),
+        }
+    }
+
     pub(super) fn remove_output(name: &str) -> Result<()> {
         let output = Command::new("hyprctl").args(["output", "remove", name]).output();
 
