@@ -650,6 +650,30 @@ impl P2pManager {
                 // decides, and it may still find one.
                 tracing::warn!("Could not reconfigure IPv4 as shared: {}", e);
             }
+
+            // Wait for the address we asked for, not merely for one to exist.
+            // NetworkManager can have its own shared default (10.42.0.1) on
+            // the interface briefly before ours lands, and a poll for "any
+            // address" happily returns that -- after which the reverse RTSP
+            // listener tries to bind an address the interface no longer has
+            // and the session dies with "Cannot assign requested address".
+            // Seen both ways on consecutive runs, which is what a race looks
+            // like.
+            let settled = self
+                .wait_for_expected_address(
+                    group_started
+                        .as_ref()
+                        .map(|info| info.interface_name.as_str()),
+                    WFD_GO_ADDRESS,
+                )
+                .await;
+            if !settled {
+                tracing::warn!(
+                    "Interface did not take {} after reconfiguring; \
+                     continuing with whatever it has",
+                    WFD_GO_ADDRESS
+                );
+            }
         }
 
         let preferred_interface = group_started
@@ -849,6 +873,23 @@ impl P2pManager {
             ip_address,
             go_ip_address: None,
         })
+    }
+
+    /// Polls until the p2p interface carries exactly `expected`, or gives up.
+    async fn wait_for_expected_address(
+        &self,
+        preferred_interface: Option<&str>,
+        expected: &str,
+    ) -> bool {
+        for _ in 0..Self::P2P_INTERFACE_POLL_ATTEMPTS {
+            if let Some((_, address)) = self.find_p2p_interface_address(preferred_interface) {
+                if address == expected {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(Self::P2P_INTERFACE_POLL_DELAY_MS)).await;
+        }
+        false
     }
 
     async fn wait_for_p2p_interface_address(
