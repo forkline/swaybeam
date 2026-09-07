@@ -199,6 +199,12 @@ pub enum NetError {
     PeerNotFound,
 }
 
+/// The address a Wi-Fi Display group owner is expected to hold, and the
+/// prefix of the group's subnet. Not a preference: sinks are built against
+/// this range.
+const WFD_GO_ADDRESS: &str = "192.168.49.1";
+const WFD_GO_PREFIX: u32 = 24;
+
 #[derive(Debug, Clone)]
 pub struct P2pConnection {
     pub sink: Sink,
@@ -524,6 +530,23 @@ impl P2pManager {
                 zvariant::Value::Str(zvariant::Str::from(ipv4_method)),
             );
             ipv4_props.insert("never-default", zvariant::Value::Bool(true));
+
+            // As group owner, take the address Wi-Fi Direct conventionally
+            // uses rather than whatever NetworkManager's shared mode would
+            // pick for itself (10.42.0.1/24). Every Miracast implementation
+            // lives on 192.168.49.0/24 -- an LG sink acting as GO handed us
+            // 192.168.49.10 with itself on .1 -- and a sink that assumes that
+            // range will complete RTSP and then fail to exchange media on any
+            // other, which is exactly how a Samsung sink behaves here.
+            if ipv4_method == "shared" {
+                let mut address: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
+                address.insert(
+                    "address",
+                    zvariant::Value::Str(zvariant::Str::from(WFD_GO_ADDRESS)),
+                );
+                address.insert("prefix", zvariant::Value::U32(WFD_GO_PREFIX));
+                ipv4_props.insert("address-data", zvariant::Value::new(vec![address]));
+            }
 
             let mut ipv6_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
             ipv6_props.insert("method", zvariant::Value::Str(zvariant::Str::from("auto")));
