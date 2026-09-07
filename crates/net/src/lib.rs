@@ -131,6 +131,16 @@ trait Device {
 
     #[zbus(property)]
     fn active_connection(&self) -> zbus::Result<zvariant::OwnedObjectPath>;
+
+    /// Re-applies IP configuration to a device without re-associating, which
+    /// is what lets a P2P group that has already formed switch IPv4 method
+    /// once the negotiated role is known.
+    fn reapply(
+        &self,
+        connection: std::collections::HashMap<&str, std::collections::HashMap<&str, zvariant::Value<'_>>>,
+        version_id: u64,
+        flags: u32,
+    ) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(
@@ -199,8 +209,20 @@ pub struct P2pConnection {
 #[derive(Debug, Clone)]
 struct GroupStartedInfo {
     interface_name: String,
-    ip_address: String,
+    /// "GO" or "client". Which side owns the group decides who assigns
+    /// addresses, so this is not cosmetic: as GO nothing will hand us one.
+    role: String,
+    /// Only present when the group owner uses the P2P IP Address Allocation
+    /// extension. An LG webOS sink does; a Samsung one does not, and expects
+    /// plain DHCP instead -- so this being absent is normal, not an error.
+    ip_address: Option<String>,
     go_ip_address: Option<String>,
+}
+
+impl GroupStartedInfo {
+    fn is_group_owner(&self) -> bool {
+        self.role == "GO"
+    }
 }
 
 pub struct P2pManager {
@@ -475,12 +497,6 @@ impl P2pManager {
                 zvariant::ObjectPath::try_from(path.as_str()).map_err(NetError::ZVariantError)
             })?;
 
-        let mut wifi_p2p_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
-        wifi_p2p_props.insert(
-            "peer",
-            zvariant::Value::Str(zvariant::Str::from(&sink.address)),
-        );
-
         // WFD Device Information Subelement (Wi-Fi Display spec Table 4)
         // Match GNOME Network Displays for LG/webOS interoperability.
         // Format: [Subelement ID] [Length] [Device Info: 2 bytes] [RTSP Port] [Throughput]
@@ -491,37 +507,60 @@ impl P2pManager {
             0x1C, 0x44, // RTSP Port: 7236 (big-endian)
             0x00, 0xC8, // Max Throughput: 200 Mbps
         ];
-        wifi_p2p_props.insert(
-            "wfd-ies",
-            zvariant::Value::Array(zvariant::Array::from(&wfd_ies)),
-        );
 
-        let mut connection_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
-        connection_props.insert(
-            "type",
-            zvariant::Value::Str(zvariant::Str::from("wifi-p2p")),
-        );
-        connection_props.insert(
-            "id",
-            zvariant::Value::Str(zvariant::Str::from(&self.config.group_name)),
-        );
-        connection_props.insert("autoconnect", zvariant::Value::Bool(false));
+        // Which IPv4 method is right depends on the role the group ends up
+        // negotiating, which is not known until the group has formed:
+        //
+        //   client -> "auto", DHCP a lease from the sink acting as GO
+        //   GO     -> "shared", let NetworkManager assign our address and
+        //             serve DHCP to the sink
+        //
+        // So the group is formed as a client and reconfigured below if the
+        // negotiation went the other way.
+        let build_config = |ipv4_method: &'static str| {
+            let mut ipv4_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
+            ipv4_props.insert(
+                "method",
+                zvariant::Value::Str(zvariant::Str::from(ipv4_method)),
+            );
+            ipv4_props.insert("never-default", zvariant::Value::Bool(true));
 
-        let mut ipv4_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
-        ipv4_props.insert("method", zvariant::Value::Str(zvariant::Str::from("auto")));
-        ipv4_props.insert("never-default", zvariant::Value::Bool(true));
+            let mut ipv6_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
+            ipv6_props.insert("method", zvariant::Value::Str(zvariant::Str::from("auto")));
+            ipv6_props.insert("never-default", zvariant::Value::Bool(true));
+            ipv6_props.insert("may-fail", zvariant::Value::Bool(true));
 
-        let mut ipv6_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
-        ipv6_props.insert("method", zvariant::Value::Str(zvariant::Str::from("auto")));
-        ipv6_props.insert("never-default", zvariant::Value::Bool(true));
-        ipv6_props.insert("may-fail", zvariant::Value::Bool(true));
+            let mut connection_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
+            connection_props.insert(
+                "type",
+                zvariant::Value::Str(zvariant::Str::from("wifi-p2p")),
+            );
+            connection_props.insert(
+                "id",
+                zvariant::Value::Str(zvariant::Str::from(&self.config.group_name)),
+            );
+            connection_props.insert("autoconnect", zvariant::Value::Bool(false));
 
-        let connection_config: HashMap<&str, HashMap<&str, zvariant::Value<'_>>> = HashMap::from([
-            ("connection", connection_props),
-            ("wifi-p2p", wifi_p2p_props),
-            ("ipv4", ipv4_props),
-            ("ipv6", ipv6_props),
-        ]);
+            let mut wifi_p2p_props: HashMap<&str, zvariant::Value<'_>> = HashMap::new();
+            wifi_p2p_props.insert(
+                "peer",
+                zvariant::Value::Str(zvariant::Str::from(&sink.address)),
+            );
+            wifi_p2p_props.insert(
+                "wfd-ies",
+                zvariant::Value::Array(zvariant::Array::from(&wfd_ies)),
+            );
+
+            HashMap::from([
+                ("connection", connection_props),
+                ("wifi-p2p", wifi_p2p_props),
+                ("ipv4", ipv4_props),
+                ("ipv6", ipv6_props),
+            ])
+        };
+
+        let connection_config: HashMap<&str, HashMap<&str, zvariant::Value<'_>>> =
+            build_config("auto");
 
         let activation_options: HashMap<&str, zvariant::Value<'_>> = HashMap::from([
             (
@@ -557,6 +596,39 @@ impl P2pManager {
         // Prefer the wpa_supplicant group-start event so we can connect immediately.
         tracing::info!("Waiting for P2P group IP information...");
         let group_started = self.wait_for_group_started().await;
+
+        // If the negotiation made us the group owner, nothing is going to
+        // hand us an address: the GO is the side that assigns them. Left as
+        // "auto" the DHCP client just waits out its timeout and the session
+        // dies with "No IP address assigned" -- which is what a Samsung sink
+        // does roughly three times in four, since neither side can set its
+        // GO intent (wpa_supplicant's D-Bus interface is root-only, and
+        // NetworkManager exposes no GO-intent property) and the tie is broken
+        // at random.
+        //
+        // Reapply switches the already-formed group to "shared", where
+        // NetworkManager assigns our address and runs DHCP for the sink,
+        // without re-associating and risking a different role.
+        if group_started
+            .as_ref()
+            .is_some_and(GroupStartedInfo::is_group_owner)
+        {
+            tracing::info!("Negotiated the group owner role; reconfiguring IPv4 as shared");
+            let device_proxy = DeviceProxy::builder(&self.connection)
+                .path(device_path.clone())?
+                .build()
+                .await
+                .map_err(|e| {
+                    NetError::NetworkManagerError(format!("Failed to create device proxy: {}", e))
+                })?;
+
+            if let Err(e) = device_proxy.reapply(build_config("shared"), 0, 0).await {
+                // Not fatal on its own: the address poll below is what
+                // decides, and it may still find one.
+                tracing::warn!("Could not reconfigure IPv4 as shared: {}", e);
+            }
+        }
+
         let preferred_interface = group_started
             .as_ref()
             .map(|info| info.interface_name.as_str());
@@ -586,10 +658,19 @@ impl P2pManager {
                     .unwrap_or_else(|| self.config.interface_name.clone()),
             )
         };
-        let go_ip_address = group_started
+        // As GO we *are* the group owner, so the "GO address" is our own --
+        // deriving a .1 from our address would point at nothing.
+        let go_ip_address = if group_started
             .as_ref()
-            .and_then(|info| info.go_ip_address.clone())
-            .or_else(|| Self::derive_go_ip_address(&ip_address));
+            .is_some_and(GroupStartedInfo::is_group_owner)
+        {
+            Some(ip_address.clone())
+        } else {
+            group_started
+                .as_ref()
+                .and_then(|info| info.go_ip_address.clone())
+                .or_else(|| Self::derive_go_ip_address(&ip_address))
+        };
 
         tracing::info!("Got IP address: {}", ip_address);
 
@@ -637,9 +718,10 @@ impl P2pManager {
                 let args = signal.args().ok()?;
                 if let Some(info) = self.parse_group_started_properties(&args.properties).await {
                     tracing::info!(
-                        "Observed P2P group start over D-Bus on {} with local {}",
+                        "Observed P2P group start over D-Bus on {} as {} with local {}",
                         info.interface_name,
-                        info.ip_address
+                        info.role,
+                        info.ip_address.as_deref().unwrap_or("no address yet")
                     );
                     return Some(info);
                 }
@@ -676,10 +758,11 @@ impl P2pManager {
                 .find_map(Self::parse_group_started_line)
             {
                 tracing::info!(
-                    "Observed P2P group start on {} with local {} and GO {}",
+                    "Observed P2P group start on {} as {} with local {} and GO {}",
                     info.interface_name,
-                    info.ip_address,
-                    info.go_ip_address.as_deref().unwrap_or("unknown")
+                    info.role,
+                    info.ip_address.as_deref().unwrap_or("none advertised"),
+                    info.go_ip_address.as_deref().unwrap_or("none advertised")
                 );
                 return Some(info);
             }
@@ -725,10 +808,6 @@ impl P2pManager {
             .ok()?
             .try_into()
             .ok()?;
-        if role != "client" {
-            return None;
-        }
-
         let interface = WpaInterfaceProxy::builder(&self.connection)
             .path(interface_object)
             .ok()?
@@ -738,11 +817,12 @@ impl P2pManager {
         let interface_name = interface.Ifname().await.ok()?;
         let ip_address = self
             .wait_for_p2p_interface_address(Some(&interface_name))
-            .await?
-            .1;
+            .await
+            .map(|(_, address)| address);
 
         Some(GroupStartedInfo {
             interface_name,
+            role,
             ip_address,
             go_ip_address: None,
         })
@@ -763,28 +843,40 @@ impl P2pManager {
         None
     }
 
+    /// Parses a wpa_supplicant `P2P-GROUP-STARTED` line, e.g.
+    ///
+    ///   P2P-GROUP-STARTED p2p-wlan0-0 client ssid="DIRECT-x" freq=2412 \
+    ///     ip_addr=192.168.49.10 go_ip_addr=192.168.49.1
+    ///   P2P-GROUP-STARTED p2p-wlan0-1 GO ssid="DIRECT-Ex" freq=2412
+    ///
+    /// `ip_addr`/`go_ip_addr` come from the P2P IP Address Allocation
+    /// extension and are frequently absent -- always when we are the GO,
+    /// since the GO is the one handing addresses out, and also from sinks
+    /// that simply do not implement it and expect DHCP. This used to require
+    /// both, so any such line parsed as None and the caller logged "did not
+    /// observe P2P-GROUP-STARTED" for a group that had started perfectly
+    /// well, discarding the role along with it.
     fn parse_group_started_line(line: &str) -> Option<GroupStartedInfo> {
         let marker = "P2P-GROUP-STARTED ";
         let start = line.find(marker)? + marker.len();
         let data = &line[start..];
-        let interface_name = data.split_whitespace().next()?.to_string();
-        let ip_address = data
-            .split("ip_addr=")
-            .nth(1)?
-            .split_whitespace()
-            .next()?
-            .to_string();
-        let go_ip_address = data
-            .split("go_ip_addr=")
-            .nth(1)?
-            .split_whitespace()
-            .next()?
-            .to_string();
+        let mut fields = data.split_whitespace();
+        let interface_name = fields.next()?.to_string();
+        let role = fields.next()?.to_string();
+
+        let field = |key: &str| -> Option<String> {
+            data.split(key)
+                .nth(1)?
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+        };
 
         Some(GroupStartedInfo {
             interface_name,
-            ip_address,
-            go_ip_address: Some(go_ip_address),
+            role,
+            ip_address: field("ip_addr="),
+            go_ip_address: field("go_ip_addr="),
         })
     }
 
@@ -1063,14 +1155,50 @@ mod tests {
         assert_eq!(parse_wfd_rtsp_port(&custom_port), 2222);
     }
 
+    /// A client-role group from a sink that implements P2P IP Address
+    /// Allocation -- an LG webOS TV, in practice.
     #[test]
     fn test_parse_group_started_line() {
         let line = "P2P-GROUP-STARTED p2p-wlp2s0-7 client ssid=\"DIRECT-XY\" freq=2412 go_dev_addr=22:28:bc:a8:6c:fe [PERSISTENT] ip_addr=192.168.49.10 ip_mask=255.255.255.0 go_ip_addr=192.168.49.1";
         let info = P2pManager::parse_group_started_line(line).expect("group started info");
 
         assert_eq!(info.interface_name, "p2p-wlp2s0-7");
-        assert_eq!(info.ip_address, "192.168.49.10");
+        assert_eq!(info.role, "client");
+        assert!(!info.is_group_owner());
+        assert_eq!(info.ip_address.as_deref(), Some("192.168.49.10"));
         assert_eq!(info.go_ip_address.as_deref(), Some("192.168.49.1"));
+    }
+
+    /// The line a real Samsung sink produces when the negotiation makes *us*
+    /// the group owner: no address fields at all, because the group owner is
+    /// the side that assigns them.
+    ///
+    /// Requiring `ip_addr=` used to make this parse as None, so the role was
+    /// discarded and the caller reported that no group had started -- while
+    /// one had, with us owning it.
+    #[test]
+    fn group_owner_line_parses_without_address_fields() {
+        let line = "P2P-GROUP-STARTED p2p-wlp0s20-1 GO ssid=\"DIRECT-Ex\" freq=2412 go_dev_addr=8c:f8:c5:ef:d9:e0";
+        let info = P2pManager::parse_group_started_line(line).expect("group started info");
+
+        assert_eq!(info.interface_name, "p2p-wlp0s20-1");
+        assert_eq!(info.role, "GO");
+        assert!(info.is_group_owner());
+        assert_eq!(info.ip_address, None);
+        assert_eq!(info.go_ip_address, None);
+    }
+
+    /// A client-role group from a sink that does not implement the allocation
+    /// extension -- the same Samsung, when the tie goes the other way. The
+    /// role is what matters; the address arrives over DHCP later.
+    #[test]
+    fn client_line_parses_without_address_fields() {
+        let line = "P2P-GROUP-STARTED p2p-wlp0s20-2 client ssid=\"DIRECT-SZ[TV] Samsung\" freq=2412 go_dev_addr=d6:9d:c0:78:7c:6a";
+        let info = P2pManager::parse_group_started_line(line).expect("group started info");
+
+        assert_eq!(info.role, "client");
+        assert!(!info.is_group_owner());
+        assert_eq!(info.ip_address, None);
     }
 
     #[tokio::test]
