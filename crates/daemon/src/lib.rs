@@ -81,6 +81,12 @@ pub struct Daemon {
     event_tx: mpsc::UnboundedSender<DaemonEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<DaemonEvent>>,
     audio_sink: Option<VirtualAudioSink>,
+    /// Signals that the RTSP session ended on its own -- the sink tore it
+    /// down, or the control connection died. Without this the daemon holds
+    /// on waiting for a signal that never comes, reporting a session that no
+    /// longer exists.
+    session_end_tx: mpsc::UnboundedSender<String>,
+    session_end_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// The single mode committed to in M4. The pipeline must produce exactly
     /// this geometry: M4 is a promise, and encoding something else makes the
     /// sink decode a stream whose dimensions it was told to expect elsewhere.
@@ -141,6 +147,7 @@ impl Default for Daemon {
 impl Daemon {
     pub fn with_config(config: DaemonConfig) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (session_end_tx, session_end_rx) = mpsc::unbounded_channel();
 
         Daemon {
             state: Arc::new(PlRwLock::new(DaemonState::Idle)),
@@ -151,6 +158,8 @@ impl Daemon {
             connection: None,
             rtsp_server: None,
             virtual_output: None,
+            session_end_tx,
+            session_end_rx: Some(session_end_rx),
             selected_video_mode: None,
             event_tx,
             event_rx: Some(event_rx),
@@ -199,11 +208,38 @@ impl Daemon {
             }
         };
 
-        // Reached streaming: hold here until asked to stop.
+        // Reached streaming: hold here until asked to stop, or until the
+        // session ends by itself. Waiting only on the signal meant a sink
+        // that tore the session down left the daemon streaming to nobody,
+        // and its last emitted event still said "streaming".
         if result.is_ok() && *self.state.read() == DaemonState::Streaming {
             info!("Streaming active, press Ctrl+C to stop...");
-            let sig = (&mut shutdown).await;
-            info!("Received {}, shutting down", sig);
+            let mut session_end = self.session_end_rx.take();
+
+            tokio::select! {
+                sig = &mut shutdown => {
+                    info!("Received {}, shutting down", sig);
+                }
+                reason = async {
+                    match session_end.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // No receiver means nothing can report an end;
+                        // fall back to waiting for the signal alone.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let reason = reason.unwrap_or_else(|| "the session ended".to_string());
+                    info!("Session ended without a stop signal: {}", reason);
+                    self.event_tx
+                        .send(DaemonEvent::ErrorOccurred(format!(
+                            "Streaming stopped: {}",
+                            reason
+                        )))
+                        .ok();
+                }
+            }
+
+            self.session_end_rx = session_end;
         }
 
         if let Err(e) = self.teardown().await {
@@ -875,8 +911,15 @@ impl Daemon {
             }
         });
 
+        let session_end = self.session_end_tx.clone();
         tokio::spawn(async move {
             rtsp_client.run_keepalive().await;
+            // The keepalive loop only returns when the session is over: a
+            // TEARDOWN from the sink, or the control connection dropping. It
+            // used to return into a detached task nobody watched, so the
+            // daemon streamed on into a session that had ended and a UI
+            // reading its events went on showing the display as connected.
+            let _ = session_end.send("the display ended the session".to_string());
         });
         info!("RTSP keepalive task spawned — TCP connection will stay alive during streaming");
 
@@ -1748,8 +1791,15 @@ impl Daemon {
             }
         });
 
+        let session_end = self.session_end_tx.clone();
         tokio::spawn(async move {
             rtsp_client.run_keepalive().await;
+            // The keepalive loop only returns when the session is over: a
+            // TEARDOWN from the sink, or the control connection dropping. It
+            // used to return into a detached task nobody watched, so the
+            // daemon streamed on into a session that had ended and a UI
+            // reading its events went on showing the display as connected.
+            let _ = session_end.send("the display ended the session".to_string());
         });
         info!("RTSP keepalive task spawned — TCP connection will stay alive during streaming");
 
