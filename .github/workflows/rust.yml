@@ -83,7 +83,27 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
             libpipewire-0.3-dev \
-            pkg-config
+            pkg-config \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-pipewire
+
+      # The -dev packages above carry headers, which is all the compile needs.
+      # The tests build real GStreamer pipelines, and an element only exists at
+      # runtime if its plugin is installed -- so the plugin packages are
+      # required here and only here. Without them
+      # reserved_sockets_send_rtp_and_rtcp_on_loopback fails with
+      # `no element "x264enc"`, which reads like a code fault but is a missing
+      # gstreamer1.0-plugins-ugly.
+      #
+      # Which package holds what, for the elements these tests instantiate:
+      #   base     videotestsrc, videoconvert, videoscale
+      #   good     udpsink, rtpbin, rtpmp2tpay, imagefreeze, pulsesrc
+      #   bad      mpegtsmux, h264parse, x265enc, svtav1enc, faac
+      #   ugly     x264enc
+      #   pipewire pipewiresrc
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
