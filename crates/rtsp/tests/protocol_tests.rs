@@ -142,9 +142,20 @@ mod rtsp_protocol_tests {
         println!("=== Testing Codec Negotiation ===");
 
         // Test data: (video_formats, expected_codec)
+        //
+        // The second case used to expect H265. That was the old parser reading
+        // field 3 as a "codec mask" and testing bit 4; field 3 is the H.264
+        // level, and 4.2 encodes as `10`, so any level-4.2 sink came back
+        // HEVC-capable. `wfd_video_formats` is H.264-only -- HEVC is advertised
+        // in WFD 2.0's `wfd2_video_formats`, which is not requested -- so every
+        // one of these negotiates H.264.
         let test_cases = vec![
             ("01 01 00 0000000000000007", NegotiatedCodec::H264),
-            ("01 01 00 000000000000001F", NegotiatedCodec::H265),
+            ("01 01 00 000000000000001F", NegotiatedCodec::H264),
+            (
+                "40 00 01 10 000194FF 155575DF 00000555 00 0000 0000 1F none none",
+                NegotiatedCodec::H264,
+            ),
             (
                 "00 04 0001F437FDE63F490000000000000000",
                 NegotiatedCodec::H264,
