@@ -273,6 +273,21 @@ impl From<gst::glib::error::Error> for StreamError {
     }
 }
 
+// Decouple output pacing from a capture clock that can pause or reset.
+fn use_stream_clock(pipeline: &gst::Pipeline) {
+    pipeline.use_clock(Some(&gst::SystemClock::obtain()));
+}
+
+// CEA modes describe square-pixel video. Without this constraint videoscale
+// can preserve the capture's aspect ratio by changing pixel shape instead
+// of adding borders, leaving the encoded display geometry unlike M4.
+fn video_geometry_caps(config: &StreamConfig) -> String {
+    format!(
+        "video/x-raw,width={},height={},framerate={}/1,pixel-aspect-ratio=1/1",
+        config.video_width, config.video_height, config.video_framerate
+    )
+}
+
 /// GStreamer pipeline wrapper for Miracast streaming
 struct StreamPipelineInner {
     pipeline: gst::Pipeline,
@@ -616,7 +631,7 @@ impl StreamPipelineInner {
              ! videoconvert \
              ! videoscale \
              ! imagefreeze name=framerepeat allow-replace=true is-live=true \
-             ! video/x-raw,width={},height={},framerate={}/1 \
+             ! {} \
              ! {} name=enc {} \
              ! {} name=parser config-interval=-1 \
              ! {} \
@@ -624,9 +639,7 @@ impl StreamPipelineInner {
              ! mux.{}",
             fd,
             node_id,
-            config.video_width,
-            config.video_height,
-            config.video_framerate,
+            video_geometry_caps(&config),
             config.video_codec.gstreamer_encoder(),
             encoder_props,
             config.video_codec.parser(),
@@ -651,6 +664,14 @@ impl StreamPipelineInner {
         let pipeline: gst::Pipeline = pipeline
             .dynamic_cast::<gst::Pipeline>()
             .map_err(|_| StreamError::PipelineConstruction("Failed to cast to Pipeline".into()))?;
+
+        // A screencast is damage-driven. PipeWire may pause or renegotiate
+        // its buffers while the desktop is idle; its clock can then stop or
+        // jump backwards. imagefreeze must keep ticking independently, or
+        // the encoder sees only the first second of frames (observed with
+        // VA-API on the Samsung test). Audio sources timestamp against this
+        // same pipeline clock when do-timestamp=true.
+        use_stream_clock(&pipeline);
 
         let bus_watch_guard = {
             let bus = pipeline
@@ -811,7 +832,10 @@ impl StreamPipelineInner {
             Ok(state_change) => {
                 tracing::info!("Pipeline state change result: {:?}", state_change);
                 self.state = PipelineState::Playing;
-                tracing::info!("Pipeline successfully started");
+                tracing::info!(
+                    "Pipeline successfully started; clock={}",
+                    self.pipeline.pipeline_clock().name()
+                );
                 Ok(())
             }
             Err(e) => {
@@ -929,6 +953,88 @@ impl StreamPipeline {
                 VideoCodec::H264
             }
         }
+    }
+
+    /// Attach the sockets reserved during RTSP SETUP and enable RTP session
+    /// timing/reception reports. Call before starting the pipeline.
+    pub async fn set_transport(
+        &self,
+        rtp: &std::net::UdpSocket,
+        rtcp: &std::net::UdpSocket,
+        destination_rtcp_port: Option<u16>,
+    ) -> Result<(), StreamError> {
+        let guard = self.inner.lock().await;
+        let setup_error = |e: String| StreamError::OutputSetup(e);
+        if guard.state != PipelineState::Null || guard.pipeline.by_name("rtp-session").is_some() {
+            return Err(StreamError::InvalidConfiguration(
+                "Transport must be configured once, before playback".into(),
+            ));
+        }
+        if destination_rtcp_port == Some(0) {
+            return Err(StreamError::InvalidConfiguration(
+                "RTCP destination port cannot be zero".into(),
+            ));
+        }
+        let rtp_socket = gio::Socket::from_fd(
+            rtp.try_clone()
+                .map_err(|e| setup_error(e.to_string()))?
+                .into(),
+        )
+        .map_err(|e| setup_error(e.to_string()))?;
+        let rtcp_socket = gio::Socket::from_fd(
+            rtcp.try_clone()
+                .map_err(|e| setup_error(e.to_string()))?
+                .into(),
+        )
+        .map_err(|e| setup_error(e.to_string()))?;
+        let pipeline = &guard.pipeline;
+        let sink = pipeline
+            .by_name("udpsink")
+            .ok_or_else(|| setup_error("Missing RTP sink".into()))?;
+        let pay = pipeline
+            .by_name("pay0")
+            .or_else(|| pipeline.by_name("rtp-payloader"))
+            .ok_or_else(|| setup_error("Missing RTP payloader".into()))?;
+        sink.set_property("socket", &rtp_socket);
+        sink.set_property("close-socket", false);
+        let session = gst::ElementFactory::make("rtpbin")
+            .name("rtp-session")
+            .build()?;
+        pipeline.add(&session)?;
+        pay.unlink(&sink);
+        pay.link_pads(Some("src"), &session, Some("send_rtp_sink_0"))?;
+        session.link_pads(Some("send_rtp_src_0"), &sink, Some("sink"))?;
+        if let Some(port) = destination_rtcp_port {
+            let host = guard
+                .output_host
+                .as_deref()
+                .ok_or_else(|| setup_error("Set output before transport".into()))?;
+            let tx = gst::ElementFactory::make("udpsink")
+                .name("rtcp-output")
+                .property("host", host)
+                .property("port", i32::from(port))
+                .property("socket", &rtcp_socket)
+                .property("close-socket", false)
+                .property("sync", false)
+                .property("async", false)
+                .build()?;
+            let rx = gst::ElementFactory::make("udpsrc")
+                .name("rtcp-input")
+                .property("socket", &rtcp_socket)
+                .property("close-socket", false)
+                .property("caps", gst::Caps::builder("application/x-rtcp").build())
+                .build()?;
+            pipeline.add_many([&tx, &rx])?;
+            session.link_pads(Some("send_rtcp_src_0"), &tx, Some("sink"))?;
+            rx.link_pads(Some("src"), &session, Some("recv_rtcp_sink_0"))?;
+        }
+        tracing::info!(
+            "RTP/RTCP sockets reserved at {:?} / {:?}; peer RTCP {:?}",
+            rtp.local_addr(),
+            rtcp.local_addr(),
+            destination_rtcp_port
+        );
+        Ok(())
     }
 
     pub async fn set_output(&self, host: &str, port: u16) -> Result<(), StreamError> {
@@ -1143,5 +1249,153 @@ mod tests {
         assert_eq!(config_4k_60fps.video_height, 2160);
         assert_eq!(config_4k_60fps.video_bitrate, 40_000_000);
         assert_eq!(config_4k_60fps.video_framerate, 60);
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn scaled_video_uses_square_pixels_and_preserves_content_aspect() {
+        gst::init().unwrap();
+        let config = StreamConfig {
+            video_width: 192,
+            video_height: 108,
+            ..Default::default()
+        };
+
+        for (width, height, pillarbox) in [(192, 120, true), (384, 216, false)] {
+            let pipeline = gst::parse::launch(&format!(
+                "videotestsrc num-buffers=1 pattern=white \
+                 ! video/x-raw,format=RGB,width={width},height={height},pixel-aspect-ratio=1/1 \
+                 ! videoscale ! {} ! appsink name=output",
+                video_geometry_caps(&config)
+            ))
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+            let output = pipeline
+                .by_name("output")
+                .unwrap()
+                .downcast::<gstreamer_app::AppSink>()
+                .unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let sample = output.try_pull_sample(gst::ClockTime::from_seconds(5));
+            pipeline.set_state(gst::State::Null).unwrap();
+            let sample = sample.expect("scaled frame");
+            let info = gstreamer_video::VideoInfo::from_caps(sample.caps().unwrap()).unwrap();
+            assert_eq!((info.width(), info.height()), (192, 108));
+            assert_eq!(info.par(), gst::Fraction::new(1, 1));
+            let pixels = sample.buffer().unwrap().map_readable().unwrap();
+            let row = 54 * info.stride()[0] as usize;
+            assert_eq!(&pixels[row + 96 * 3..row + 97 * 3], &[255; 3]);
+            assert_eq!(&pixels[row..row + 3], &[if pillarbox { 0 } else { 255 }; 3]);
+        }
+    }
+
+    #[test]
+    fn stream_clock_overrides_capture_clock() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let capture_clock = gst::glib::Object::builder::<gst::SystemClock>()
+            .property("name", "capture-clock")
+            .build();
+        pipeline.use_clock(Some(&capture_clock));
+        assert_eq!(
+            pipeline.pipeline_clock(),
+            capture_clock.upcast::<gst::Clock>()
+        );
+        use_stream_clock(&pipeline);
+        assert_eq!(
+            pipeline.pipeline_clock(),
+            gst::SystemClock::obtain().upcast::<gst::Clock>()
+        );
+    }
+
+    // A synthetic RTP source exercises the same transport attachment as the
+    // PipeWire pipeline without opening a portal or touching a physical display.
+    #[tokio::test]
+    async fn reserved_sockets_send_rtp_and_rtcp_on_loopback() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("videotestsrc is-live=true ! video/x-raw,width=64,height=64,framerate=10/1 ! x264enc tune=zerolatency ! h264parse ! mpegtsmux alignment=7 ! rtpmp2tpay name=pay0 ! udpsink name=udpsink sync=false async=false").unwrap().downcast::<gst::Pipeline>().unwrap();
+        let stream = StreamPipeline {
+            inner: Arc::new(Mutex::new(StreamPipelineInner {
+                pipeline,
+                appsrc: None,
+                config: StreamConfig::default(),
+                state: PipelineState::Null,
+                output_host: None,
+                output_port: None,
+                _audio_appsrc: None,
+                bus_watch_guard: None,
+                _pw_stream: None,
+            })),
+        };
+        let rtp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rtcp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reports = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stream
+            .set_output("127.0.0.1", receiver.local_addr().unwrap().port())
+            .await
+            .unwrap();
+        stream
+            .set_transport(&rtp, &rtcp, Some(reports.local_addr().unwrap().port()))
+            .await
+            .unwrap();
+        stream.start().await.unwrap();
+        let mut packet = [0; 2048];
+        let (n, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receiver.recv_from(&mut packet),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(n > 12);
+        assert_eq!(source, rtp.local_addr().unwrap());
+        assert_eq!(packet[0] >> 6, 2);
+        let (n, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reports.recv_from(&mut packet),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(n >= 28);
+        assert_eq!(source, rtcp.local_addr().unwrap());
+        assert_eq!(packet[1], 200, "RTCP sender report");
+        // An empty receiver report introduces the remote SSRC to rtpbin.
+        reports
+            .send_to(
+                &[0x80, 201, 0, 1, 0x12, 0x34, 0x56, 0x78],
+                rtcp.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+        let session = stream
+            .inner
+            .lock()
+            .await
+            .pipeline
+            .by_name("rtp-session")
+            .unwrap()
+            .emit_by_name::<gst::glib::Object>("get-internal-session", &[&0u32]);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let source = session.emit_by_name::<Option<gst::glib::Object>>(
+                    "get-source-by-ssrc",
+                    &[&0x12345678u32],
+                );
+                if source.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("RTCP receiver report reached rtpbin");
+        stream.stop().await.unwrap();
     }
 }

@@ -197,7 +197,11 @@ impl WfdCapabilities {
                 tracing::debug!(
                     "Sink advertises {} H.264 entr{} and no wfd2_video_formats; negotiating H.264",
                     parsed.entries.len(),
-                    if parsed.entries.len() == 1 { "y" } else { "ies" }
+                    if parsed.entries.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
                 );
             }
             _ => tracing::warn!("No usable video format advertised, defaulting to H.264"),
@@ -459,11 +463,11 @@ fn parse_codec_entry(fields: &[&str]) -> Option<SinkCodecEntry> {
 /// MaxFS and `max_mbps` is MaxMBPS from Annex A of the H.264 spec.
 const H264_LEVELS: &[(u32, u32, u32)] = &[
     // bit, MaxFS (macroblocks per frame), MaxMBPS (macroblocks per second)
-    (0, 3600, 108_000),  // 3.1
-    (1, 5120, 216_000),  // 3.2
-    (2, 8192, 245_760),  // 4.0
-    (3, 8192, 245_760),  // 4.1
-    (4, 8704, 522_240),  // 4.2
+    (0, 3600, 108_000), // 3.1
+    (1, 5120, 216_000), // 3.2
+    (2, 8192, 245_760), // 4.0
+    (3, 8192, 245_760), // 4.1
+    (4, 8704, 522_240), // 4.2
 ];
 
 /// WFD profile bitmap: bit 0 is Constrained Baseline, bit 1 Constrained High.
@@ -782,6 +786,14 @@ impl RtspSession {
 
     /// Updates session information about the RTP destination from SETUP parameters
     pub fn process_setup(&mut self, transport_param: Option<String>) -> Result<String, RtspError> {
+        self.process_setup_with_ports(transport_param, (5004, 5005))
+    }
+
+    fn process_setup_with_ports(
+        &mut self,
+        transport_param: Option<String>,
+        source_ports: (u16, u16),
+    ) -> Result<String, RtspError> {
         // Parse the Transport header to extract client's RTP/RTCP port information
         if let Some(transport) = transport_param {
             // Look for client_port parameter which contains the RTP port range
@@ -808,8 +820,8 @@ impl RtspSession {
 
                         // Prepare response with server parameters
                         return Ok(format!(
-                            "Transport: RTP/AVP/UDP;unicast;client_port={};server_port=5004-5005\r\nSession: {};timeout=30\r\n",
-                            port_range, self.session_id
+                            "Transport: RTP/AVP/UDP;unicast;client_port={};server_port={}-{}\r\nSession: {};timeout=30\r\n",
+                            port_range, source_ports.0, source_ports.1, self.session_id
                         ));
                     }
                 }
@@ -817,7 +829,7 @@ impl RtspSession {
         }
 
         // Fallback response
-        Ok(format!("Transport: RTP/AVP/UDP;unicast;client_port=5004-5005;server_port=5004-5005\r\nSession: {};timeout=30\r\n", self.session_id))
+        Ok(format!("Transport: RTP/AVP/UDP;unicast;client_port=5004-5005;server_port={}-{}\r\nSession: {};timeout=30\r\n", source_ports.0, source_ports.1, self.session_id))
     }
 
     /// Returns the negotiated video codec
@@ -1137,9 +1149,47 @@ pub struct RtpInfo {
     pub session_id: Option<String>,
 }
 
+/// UDP sockets reserved before acknowledging SETUP. Shared ownership keeps the
+/// advertised ports bound until both the control session and media pipeline end.
+#[derive(Debug, Clone)]
+pub struct MediaTransport {
+    /// Reserved source RTP socket.
+    pub rtp: std::sync::Arc<std::net::UdpSocket>,
+    /// Reserved source RTCP socket.
+    pub rtcp: std::sync::Arc<std::net::UdpSocket>,
+    /// Sink RTCP port, if offered in SETUP.
+    pub destination_rtcp_port: Option<u16>,
+}
+
+impl MediaTransport {
+    /// Reserve an even RTP port and its consecutive RTCP port on the local IP.
+    pub fn bind(ip: IpAddr, destination_rtcp_port: Option<u16>) -> std::io::Result<Self> {
+        for _ in 0..128 {
+            let rtp = std::net::UdpSocket::bind(SocketAddr::new(ip, 0))?;
+            let port = rtp.local_addr()?.port();
+            if port % 2 != 0 || port == u16::MAX {
+                continue;
+            }
+            if let Ok(rtcp) = std::net::UdpSocket::bind(SocketAddr::new(ip, port + 1)) {
+                return Ok(Self {
+                    rtp: std::sync::Arc::new(rtp),
+                    rtcp: std::sync::Arc::new(rtcp),
+                    destination_rtcp_port,
+                });
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "Could not reserve RTP/RTCP port pair",
+        ))
+    }
+}
+
 /// RTP destination learned from peer-initiated SETUP/PLAY.
 #[derive(Debug, Clone)]
 pub struct PeerPlayInfo {
+    /// Reserved source transport for this SETUP.
+    pub transport: Option<MediaTransport>,
     pub dest_ip: String,
     pub dest_port: u16,
     pub session_id: Option<String>,
@@ -1165,6 +1215,7 @@ pub struct RtspClient {
     stream: Option<TcpStream>,
     cseq: u32,
     peer_session: RtspSession,
+    media_transport: Option<MediaTransport>,
     idr_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
@@ -1213,6 +1264,7 @@ impl RtspClient {
             stream: Some(stream),
             cseq: 0,
             peer_session,
+            media_transport: None,
             idr_tx: None,
         })
     }
@@ -1420,7 +1472,34 @@ impl RtspClient {
                 session: _,
                 transport,
             } => {
-                let response = self.peer_session.process_setup(transport)?;
+                let rtcp_port = transport
+                    .as_deref()
+                    .and_then(|value| {
+                        value
+                            .split(';')
+                            .find_map(|part| part.trim().strip_prefix("client_port="))
+                    })
+                    .and_then(|ports| ports.split_once('-'))
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .filter(|port| *port != 0);
+                if self.media_transport.is_none() {
+                    let ip = self
+                        .stream
+                        .as_ref()
+                        .ok_or_else(|| RtspError::ProtocolViolation("No control socket".into()))?
+                        .local_addr()?
+                        .ip();
+                    self.media_transport = Some(MediaTransport::bind(ip, rtcp_port)?);
+                }
+                let media = self.media_transport.as_mut().expect("reserved transport");
+                media.destination_rtcp_port = rtcp_port;
+                let response = self.peer_session.process_setup_with_ports(
+                    transport,
+                    (
+                        media.rtp.local_addr()?.port(),
+                        media.rtcp.local_addr()?.port(),
+                    ),
+                )?;
                 Ok(PeerRequestOutcome {
                     response: format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\n{}\r\n", cseq, response),
                     play_info: None,
@@ -1432,6 +1511,7 @@ impl RtspClient {
                 Ok(PeerRequestOutcome {
                     response: format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\n{}\r\n", cseq, response),
                     play_info: Some(PeerPlayInfo {
+                        transport: self.media_transport.clone(),
                         dest_ip: self.peer_destination_ip(),
                         dest_port: self
                             .peer_session
@@ -2553,7 +2633,10 @@ mod tests {
         let selected = WfdCapabilities::select_video_mode(LG_SINK_FORMATS, 1920, 1080, 30)
             .expect("1080p30 is advertised");
 
-        assert_eq!((selected.width, selected.height, selected.framerate), (1920, 1080, 30));
+        assert_eq!(
+            (selected.width, selected.height, selected.framerate),
+            (1920, 1080, 30)
+        );
         assert_eq!(
             selected.wfd_video_formats,
             "40 00 01 10 00000080 00000000 00000000 00 0000 0000 1F none none"
@@ -2574,7 +2657,10 @@ mod tests {
     fn selection_never_exceeds_what_the_sink_advertises() {
         let selected = WfdCapabilities::select_video_mode(LG_SINK_FORMATS, 3840, 2160, 60)
             .expect("something is advertised");
-        assert_eq!((selected.width, selected.height, selected.framerate), (1920, 1080, 30));
+        assert_eq!(
+            (selected.width, selected.height, selected.framerate),
+            (1920, 1080, 30)
+        );
     }
 
     /// A sink offering levels 3.1, 4.0 and 4.2 (bits 0, 2, 4) must not be
@@ -2663,7 +2749,10 @@ mod tests {
             .nth(2)
             .and_then(|f| u32::from_str_radix(f, 16).ok())
             .expect("profile field");
-        assert_eq!(profile, 0x01, "constrained baseline, what the encoder emits");
+        assert_eq!(
+            profile, 0x01,
+            "constrained baseline, what the encoder emits"
+        );
     }
 
     #[test]
@@ -2677,5 +2766,46 @@ mod tests {
         let caps = WfdCapabilities::source_capabilities();
         assert!(caps.video_formats.is_some());
         assert!(caps.audio_codecs.is_some());
+    }
+}
+
+#[cfg(test)]
+mod media_transport_tests {
+    use super::*;
+
+    #[test]
+    fn reserves_pair_until_last_owner_drops() {
+        let media = MediaTransport::bind("127.0.0.1".parse().unwrap(), Some(19001)).unwrap();
+        let rtp = media.rtp.local_addr().unwrap();
+        let rtcp = media.rtcp.local_addr().unwrap();
+        assert_eq!(rtp.port() % 2, 0);
+        assert_eq!(rtcp.port(), rtp.port() + 1);
+        let retained = media.clone();
+        drop(media);
+        assert!(std::net::UdpSocket::bind(rtp).is_err());
+        assert!(std::net::UdpSocket::bind(rtcp).is_err());
+        drop(retained);
+        assert!(std::net::UdpSocket::bind(rtp).is_ok());
+        assert!(std::net::UdpSocket::bind(rtcp).is_ok());
+    }
+
+    #[tokio::test]
+    async fn setup_advertises_reserved_ports_and_preserves_rtcp_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut client =
+            RtspClient::from_stream(peer.local_addr().unwrap().to_string(), socket).unwrap();
+        let result = client.build_peer_request_response("SETUP rtsp://127.0.0.1/wfd1.0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/UDP;unicast;client_port=19000-19007\r\n\r\n").unwrap();
+        let media = client.media_transport.as_ref().unwrap();
+        assert!(result.response.contains(&format!(
+            "server_port={}-{}",
+            media.rtp.local_addr().unwrap().port(),
+            media.rtcp.local_addr().unwrap().port()
+        )));
+        assert_eq!(media.destination_rtcp_port, Some(19007));
+        assert!(std::net::UdpSocket::bind(media.rtp.local_addr().unwrap()).is_err());
     }
 }

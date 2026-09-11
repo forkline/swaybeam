@@ -14,9 +14,7 @@ pub enum ExternalError {
     ConfigReadFailed(String),
     #[error("Failed to write portal config: {0}")]
     ConfigWriteFailed(String),
-    #[error(
-        "No supported compositor detected (checked $HYPRLAND_INSTANCE_SIGNATURE, $SWAYSOCK)"
-    )]
+    #[error("No supported compositor detected (checked $HYPRLAND_INSTANCE_SIGNATURE, $SWAYSOCK)")]
     UnsupportedCompositor,
 }
 
@@ -611,7 +609,8 @@ mod sway {
     }
 
     pub(super) fn restore_portal_config(path: &PathBuf, config: &str) -> Result<()> {
-        std::fs::write(path, config).map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
+        std::fs::write(path, config)
+            .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
 
         let _ = Command::new("systemctl")
             .args(["--user", "restart", "xdg-desktop-portal-wlr"])
@@ -956,7 +955,9 @@ mod hyprland {
     }
 
     pub(super) fn remove_output(name: &str) -> Result<()> {
-        let output = Command::new("hyprctl").args(["output", "remove", name]).output();
+        let output = Command::new("hyprctl")
+            .args(["output", "remove", name])
+            .output();
 
         let removed = match output {
             Ok(o) if o.status.success() => {
@@ -1030,12 +1031,11 @@ mod hyprland {
             .map(PathBuf::from)
             .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
             .map_err(|_| {
-                ExternalError::ConfigWriteFailed(
-                    "Neither $XDG_STATE_HOME nor $HOME is set".into(),
-                )
+                ExternalError::ConfigWriteFailed("Neither $XDG_STATE_HOME nor $HOME is set".into())
             })?;
         let dir = base.join("swaybeam");
-        std::fs::create_dir_all(&dir).map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
         Ok(dir)
     }
 
@@ -1216,8 +1216,7 @@ exec {fallback_binary} "$@"
     }
 
     pub(super) fn marker_path() -> PathBuf {
-        let runtime_dir =
-            std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(runtime_dir).join(PICKER_MARKER_FILENAME)
     }
 
@@ -1235,12 +1234,11 @@ exec {fallback_binary} "$@"
             .map(PathBuf::from)
             .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .map_err(|_| {
-                ExternalError::ConfigWriteFailed(
-                    "Neither $XDG_DATA_HOME nor $HOME is set".into(),
-                )
+                ExternalError::ConfigWriteFailed("Neither $XDG_DATA_HOME nor $HOME is set".into())
             })?;
         let dir = data_home.join("swaybeam");
-        std::fs::create_dir_all(&dir).map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ExternalError::ConfigWriteFailed(e.to_string()))?;
         Ok(dir.join(PICKER_SCRIPT_FILENAME))
     }
 
@@ -1475,7 +1473,10 @@ mod tests {
              screencopy {\n    custom_picker_binary = /x/swaybeam-hyprland-picker.sh\n    allow_token_by_default = true\n}\n\
              # --- end swaybeam block ---\n";
 
-        assert_eq!(hyprland::strip_managed_block(with_block).as_deref(), Some(""));
+        assert_eq!(
+            hyprland::strip_managed_block(with_block).as_deref(),
+            Some("")
+        );
     }
 
     #[test]

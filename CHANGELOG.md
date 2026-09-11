@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Provide persistent Wi-Fi Direct PC identity configuration for automatic full-screen sharing on LG webOS, with an Arch Linux systemd service example.
+- Remove unused Rust PipeWire test bindings that broke workspace builds with current system headers; check the GStreamer capture plugin instead.
+- Keep square pixels when scaling captured video to the negotiated mode, preserving desktop proportions with borders instead of anamorphic video.
+- Use the system clock for PipeWire streaming so capture clock resets do not freeze video output.
+- Select software H.264 automatically for the observed Samsung 8 Series (55), while preserving explicit codec overrides.
+- Reserve and advertise the actual RTP/RTCP sockets for peer-initiated SETUP, and use GStreamer RTP session handling.
+- Avoid RTSP client connections to the local group-owner address and clarify pre-stream DHCP/RTSP failures.
+
 ## [v0.4.3](https://github.com/forkline/swaybeam/tree/v0.4.3) - 2026-05-02
 
 ### Fixed

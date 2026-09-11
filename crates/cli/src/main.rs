@@ -71,6 +71,8 @@ enum Command {
     Daemon {
         #[arg(short, long)]
         sink: Option<String>,
+        /// Initiate the RTSP TCP connection instead of listening for the TV.
+        /// Does not select the Wi-Fi Direct group-owner role.
         #[arg(short, long)]
         client: bool,
         /// Extend the desktop onto the sink via a 1080p virtual output,
@@ -121,9 +123,7 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Command::Doctor => doctor_command(cli.json).await,
-        Command::Discover { timeout } => {
-            discover_command(*timeout, &cli.interface, cli.json).await
-        }
+        Command::Discover { timeout } => discover_command(*timeout, &cli.interface, cli.json).await,
         Command::Connect { sink } => connect_command(sink, &cli.interface, cli.json).await,
         Command::Stream {
             width,
@@ -355,7 +355,11 @@ fn daemon_event_json(event: swaybeam_daemon::DaemonEvent) -> serde_json::Value {
             "event": "connected",
             "sink": sink_json(&sink),
         }),
-        DaemonEvent::VirtualOutputCreated { name, width, height } => json!({
+        DaemonEvent::VirtualOutputCreated {
+            name,
+            width,
+            height,
+        } => json!({
             "event": "virtual_output_created",
             "name": name,
             "width": width,
@@ -395,7 +399,7 @@ async fn daemon_command(
     if !json_output {
         println!("Starting Miracast daemon...");
         if client_mode {
-            println!("Running in RTSP client mode (TV is Group Owner)");
+            println!("Requesting an outgoing RTSP connection (Wi-Fi Direct role is negotiated separately)");
         }
         if extend_mode {
             println!("Running in extend mode (1080p virtual output)");
@@ -577,6 +581,9 @@ mod tests {
             json!({"event": "error", "message": "Sink 'x' not found"})
         );
 
-        assert_eq!(daemon_event_json(DaemonEvent::Ended), json!({"event": "ended"}));
+        assert_eq!(
+            daemon_event_json(DaemonEvent::Ended),
+            json!({"event": "ended"})
+        );
     }
 }

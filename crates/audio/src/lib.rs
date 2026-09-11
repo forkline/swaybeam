@@ -165,7 +165,9 @@ fn state_dir() -> Result<PathBuf> {
     let base = std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .map_err(|_| AudioError::CommandFailed("Neither $XDG_STATE_HOME nor $HOME is set".into()))?;
+        .map_err(|_| {
+            AudioError::CommandFailed("Neither $XDG_STATE_HOME nor $HOME is set".into())
+        })?;
     let dir = base.join("swaybeam");
     std::fs::create_dir_all(&dir).map_err(|e| AudioError::CommandFailed(e.to_string()))?;
     Ok(dir)
@@ -178,7 +180,11 @@ fn breadcrumb_path() -> Result<PathBuf> {
 // Three lines: sink_name, module_index, previous_default (blank line if
 // there wasn't one). Plain text, not JSON: this crate has no serde
 // dependency and the shape is simple enough not to need one.
-fn write_breadcrumb(sink_name: &str, module_index: u32, previous_default: Option<&str>) -> Result<()> {
+fn write_breadcrumb(
+    sink_name: &str,
+    module_index: u32,
+    previous_default: Option<&str>,
+) -> Result<()> {
     // Leading pid: breadcrumbs exist for the whole of a live session, so
     // an owner is what lets cleanup_stale tell "left over from a crash"
     // from "in use by a running instance right now".
@@ -189,7 +195,8 @@ fn write_breadcrumb(sink_name: &str, module_index: u32, previous_default: Option
         module_index,
         previous_default.unwrap_or("")
     );
-    std::fs::write(breadcrumb_path()?, content).map_err(|e| AudioError::CommandFailed(e.to_string()))
+    std::fs::write(breadcrumb_path()?, content)
+        .map_err(|e| AudioError::CommandFailed(e.to_string()))
 }
 
 fn remove_breadcrumb() {
@@ -398,8 +405,10 @@ mod tests {
 
     #[test]
     fn parse_breadcrumb_round_trips_with_previous_default() {
-        let stale = parse_breadcrumb("swaybeam_sink_abcd1234\n536870916\nalsa_output.pci-0000_00_1f.3.HiFi__Speaker__sink\n")
-            .expect("valid breadcrumb should parse");
+        let stale = parse_breadcrumb(
+            "swaybeam_sink_abcd1234\n536870916\nalsa_output.pci-0000_00_1f.3.HiFi__Speaker__sink\n",
+        )
+        .expect("valid breadcrumb should parse");
         assert_eq!(stale.sink_name, "swaybeam_sink_abcd1234");
         assert_eq!(stale.module_index, 536870916);
         assert_eq!(

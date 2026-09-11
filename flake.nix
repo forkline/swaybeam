@@ -36,31 +36,13 @@
 
         cargoVendorDir = craneLib.vendorCargoDeps {
           inherit src;
-          overrideVendorCargoPackage = p: drv:
-            if p.name == "libspa" && p.version == "0.10.0" then
-              drv.overrideAttrs (_old: {
-                postPatch = ''
-                  substituteInPlace src/constants.rs \
-                    --replace-fail 'spa_sys::SPA_ID_INVALID' '0xffffffff'
-                '';
-              })
-            else if p.name == "pipewire" && p.version == "0.10.0" then
-              drv.overrideAttrs (_old: {
-                postPatch = ''
-                  substituteInPlace src/constants.rs \
-                    --replace-fail 'pw_sys::PW_ID_ANY' '0xffffffff'
-                '';
-              })
-            else
-              drv;
         };
 
         commonArgs = {
           pname = "swaybeam";
           inherit src cargoVendorDir;
           doCheck = false;
-          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper llvmPackages.clang llvmPackages.libclang ];
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
           buildInputs = with pkgs; [
             gst_all_1.gstreamer
             gst_all_1.gst-plugins-base
@@ -104,7 +86,6 @@
           packages = with pkgs; [
             rustToolchain
             pkg-config
-            llvmPackages.libclang
             just
             rust-analyzer
           ];

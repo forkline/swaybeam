@@ -233,7 +233,7 @@ H.265 and AV1 exist in the encoder layer but are not reachable from the CLI:
 ### CLI Options
 
 ```bash
-# Auto-select (default) - hardware H.264 when available
+# Auto-select (default) - hardware H.264 when available, with Samsung compatibility fallback
 swaybeam daemon --sink "TV" --client
 
 # Force H.264 with hardware encoding
@@ -250,6 +250,90 @@ swaybeam daemon --sink "TV" --client --codec h264-sw
 > `wfd_video_formats` harder -- an earlier version appeared to auto-select
 > H.265 by reading that parameter's H.264 *level* field as a codec bitmask,
 > and level 4.2 encodes as `10`, so every level-4.2 sink looked HEVC-capable.
+
+### Samsung 8 Series compatibility
+
+Auto mode selects software H.264 for the discovered name
+`[TV] Samsung 8 Series (55)`. Live testing showed updating video with `x264enc`,
+while VA-API H.264 initially displayed a frozen picture. Tracing showed that
+the local pipeline stopped producing frames when its PipeWire clock stalled
+during capture reconfiguration. The capture pipeline now uses GStreamer's
+system clock so output pacing continues independently of capture updates.
+An explicit `--codec h264` overrides the conservative software choice.
+
+```bash
+swaybeam --interface wlp0s20f3 daemon --sink "[TV] Samsung 8 Series (55)"
+```
+
+Use the default RTSP role: the TV connects to the laptop. `--client` controls
+who opens the RTSP connection, not who becomes Wi-Fi Direct group owner.
+Content protection remains `none`; this worked in the software session.
+The compatibility rule uses the discovery name, so a renamed TV should use
+`--codec h264-sw` explicitly.
+
+The peer-initiated SETUP path reserves an RTP/RTCP socket pair on the local
+P2P address before acknowledging SETUP, advertises those actual ports, and
+passes the same sockets to GStreamer. `rtpbin` supplies sender reports and
+processes receiver reports when the TV offers an RTCP port. It comes from
+`gst-plugins-good`, already included in the Nix runtime.
+
+Pairing can still fail independently of encoding. A local group-owner address
+does not prove the TV accepted its DHCP lease. Diagnose DHCP and incoming
+RTSP separately from video decoding; do not infer an encoder failure from a
+connection timeout.
+
+Local validation (no TV, discovery, or portal requests):
+
+```bash
+cargo test -p swaybeam-rtsp -p swaybeam-stream --features swaybeam-capture/real_portal
+```
+
+Live testing on 2026-09-10 exercised the updated RTP/RTCP path, but visual
+feedback could not be reliably attributed to individual runs. With the clock
+fix, the hardware run transmitted 4,917 frames
+over 164 seconds, with zero packet loss reported by the TV; the first 150
+seconds of captured video decoded without errors. Hardware screen movement
+still needs visual confirmation. Repeated connections, idle/resume, and
+`--extend` remain follow-up checks.
+
+### LG Screen Share appears in a small window
+
+If the **whole desktop** appears in a small window while ordinary TV content
+remains visible around it, webOS is using **Screen Share Overlay Mode**.
+Select the shared-screen window with the TV remote and choose its full-screen
+control as a temporary workaround. This applies to both mirror and extend
+mode; changing the source to 4K does not change the TV's overlay layout. See the
+[LG Screen Share guide](https://kr.eguide.lgappstv.com/manual/w20/dvb/Contents/share/phonescreen_e_c_a_t_01/eng/w50__share__phonescreen_e_c_a_t_01__eng.html).
+
+For automatic full-screen startup on the tested LG, advertise the Wi-Fi
+Direct source as a PC. On this system, wpa_supplicant advertised an all-zero
+`PrimaryDeviceType`. Changing only that field to the standard WPS PC type
+`1-0050F204-1` made the OLED55B9PLA start full-screen automatically.
+This identity is managed by wpa_supplicant, outside the video/RTSP pipeline.
+Automatic full-screen startup was confirmed again after restarting
+wpa_supplicant with the persistent configuration below.
+
+For the stock Arch Linux systemd service, install the supplied P2P config
+and service drop-in:
+
+```bash
+sudo install -D -m 0644 contrib/wpa_supplicant/swaybeam-p2p.conf /etc/wpa_supplicant/swaybeam-p2p.conf
+sudo install -D -m 0644 contrib/systemd/wpa_supplicant.service.d/50-swaybeam-p2p.conf /etc/systemd/system/wpa_supplicant.service.d/50-swaybeam-p2p.conf
+sudo systemctl daemon-reload
+sudo systemctl restart wpa_supplicant
+```
+
+Restarting wpa_supplicant briefly interrupts Wi-Fi. On other distributions or
+customized services, preserve the existing `ExecStart` command and append
+`-m /etc/wpa_supplicant/swaybeam-p2p.conf` instead of copying the example
+drop-in verbatim. If a P2P config is already supplied with `-m`, set
+`device_type=1-0050F204-1` in that file instead. No credentials belong in the
+supplied P2P identity file. The setting is loaded whenever the P2P device is
+created, including after restart, and requires no per-cast privilege prompt.
+
+The OLED55B9PLA negotiates 1920x1080p30 with this source. Video is scaled to
+that mode with square pixels. A 16:10 laptop screen has narrow side borders
+to preserve its proportions; a 16:9 extended desktop fills the video frame.
 
 ### Hardware Encoding Dependencies
 

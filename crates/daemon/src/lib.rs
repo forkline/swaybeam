@@ -91,6 +91,7 @@ pub struct Daemon {
     /// this geometry: M4 is a promise, and encoding something else makes the
     /// sink decode a stream whose dimensions it was told to expect elsewhere.
     selected_video_mode: Option<swaybeam_rtsp::SelectedVideoMode>,
+    media_transport: Option<swaybeam_rtsp::MediaTransport>,
 }
 
 #[derive(Debug)]
@@ -102,7 +103,11 @@ pub enum DaemonEvent {
     /// (or a fixed external resolution) — carries the compositor-assigned
     /// output name (e.g. "HEADLESS-1") a caller needs to do anything with
     /// it (place it in a layout, report it to a UI, etc.).
-    VirtualOutputCreated { name: String, width: u32, height: u32 },
+    VirtualOutputCreated {
+        name: String,
+        width: u32,
+        height: u32,
+    },
     Negotiated,
     StreamingStarted,
     StreamingStopped,
@@ -161,6 +166,7 @@ impl Daemon {
             session_end_tx,
             session_end_rx: Some(session_end_rx),
             selected_video_mode: None,
+            media_transport: None,
             event_tx,
             event_rx: Some(event_rx),
             audio_sink: None,
@@ -271,6 +277,7 @@ impl Daemon {
         // string would still size its pipeline from the *previous* sink --
         // streaming one geometry while M4 announced another.
         self.selected_video_mode = None;
+        self.media_transport = None;
 
         if let Some(ref mut output) = self.virtual_output {
             info!("Cleaning up virtual output...");
@@ -735,6 +742,11 @@ impl Daemon {
         const RTSP_CONNECT_RETRY_DELAY_MS: u64 = 500;
 
         let mut connect_error = None;
+        if local_ip.as_deref() == Some(go_ip.as_str()) {
+            info!("Local host is the P2P group owner; listening for the TV instead of dialing our own address");
+            return self.negotiate_as_reverse_client(&go_ip, rtsp_port).await;
+        }
+
         let mut rtsp_client = None;
         for attempt in 1..=RTSP_CONNECT_ATTEMPTS {
             match RtspClient::connect(&go_ip, rtsp_port, local_ip.as_deref()).await {
@@ -844,7 +856,7 @@ impl Daemon {
 
         let mut rtsp_client =
             RtspClient::accept_reverse(&bind_addr, go_ip, rtsp_port, Duration::from_secs(15))
-                .await?;
+                .await.map_err(|error| anyhow::anyhow!("Waiting for the TV's RTSP connection on {bind_addr} failed: {error}. A local P2P address does not confirm the TV received its DHCP lease; inspect DHCP ACK/NAK events and TCP reachability before changing encoders."))?;
 
         let (idr_tx, mut idr_rx) = mpsc::unbounded_channel::<()>();
         rtsp_client.set_idr_channel(idr_tx);
@@ -884,6 +896,7 @@ impl Daemon {
         let play_info = rtsp_client
             .wait_for_peer_play(Duration::from_secs(15))
             .await?;
+        self.media_transport = play_info.transport.clone();
         info!(
             "TV initiated SETUP+PLAY, streaming to {}:{}",
             play_info.dest_ip, play_info.dest_port
@@ -1764,6 +1777,7 @@ impl Daemon {
         let play_info = rtsp_client
             .wait_for_peer_play(Duration::from_secs(15))
             .await?;
+        self.media_transport = play_info.transport.clone();
         info!(
             "TV initiated SETUP+PLAY, streaming to {}:{}",
             play_info.dest_ip, play_info.dest_port
@@ -1909,6 +1923,15 @@ impl Daemon {
             return codec.clone();
         }
 
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| samsung_software_compatibility(&connection.get_sink().name))
+        {
+            info!("Samsung 8 Series compatibility: selecting software H.264; use --codec h264 to explicitly test hardware encoding");
+            return VideoCodec::H264;
+        }
+
         // Ask the parser, not the raw text. This used to be
         // `formats.contains("02")`, which matches anywhere in the value --
         // a CEA bitmap of 00000200, a latency field, a max-hres of 0200 --
@@ -1986,7 +2009,9 @@ impl Daemon {
             // Must match what run_inner() sized the virtual output to for
             // extend mode, and what the sink can actually decode -- see the
             // 1080p rationale there.
-            None if self.config.extend_mode => (1920, 1080, self.config.video_framerate, 10_000_000u32),
+            None if self.config.extend_mode => {
+                (1920, 1080, self.config.video_framerate, 10_000_000u32)
+            }
             None => (
                 self.config.video_width,
                 self.config.video_height,
@@ -2048,6 +2073,15 @@ impl Daemon {
         pipeline
             .set_output(destination_ip, destination_rtp_port)
             .await?;
+        if let Some(ref transport) = self.media_transport {
+            pipeline
+                .set_transport(
+                    &transport.rtp,
+                    &transport.rtcp,
+                    transport.destination_rtcp_port,
+                )
+                .await?;
+        }
         pipeline.start().await?;
         info!(
             "PipeWire stream pipeline started to {}:{}",
@@ -2078,8 +2112,22 @@ impl Daemon {
     }
 }
 
+fn samsung_software_compatibility(name: &str) -> bool {
+    name.trim()
+        .eq_ignore_ascii_case("[TV] Samsung 8 Series (55)")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn samsung_compatibility_is_scoped_to_observed_model() {
+        assert!(super::samsung_software_compatibility(
+            "[TV] Samsung 8 Series (55)"
+        ));
+        assert!(!super::samsung_software_compatibility("Samsung other TV"));
+        assert!(!super::samsung_software_compatibility("LG webOS"));
+    }
+
     use super::Daemon;
 
     #[test]

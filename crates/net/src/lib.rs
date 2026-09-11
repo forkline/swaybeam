@@ -137,7 +137,10 @@ trait Device {
     /// once the negotiated role is known.
     fn reapply(
         &self,
-        connection: std::collections::HashMap<&str, std::collections::HashMap<&str, zvariant::Value<'_>>>,
+        connection: std::collections::HashMap<
+            &str,
+            std::collections::HashMap<&str, zvariant::Value<'_>>,
+        >,
         version_id: u64,
         flags: u32,
     ) -> zbus::Result<()>;
@@ -668,11 +671,9 @@ impl P2pManager {
                 )
                 .await;
             if !settled {
-                tracing::warn!(
-                    "Interface did not take {} after reconfiguring; \
-                     continuing with whatever it has",
-                    WFD_GO_ADDRESS
-                );
+                return Err(NetError::ConnectionFailed(format!(
+                    "P2P group owner interface did not acquire {WFD_GO_ADDRESS}; cannot start RTSP reliably"
+                )));
             }
         }
 
