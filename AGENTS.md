@@ -247,8 +247,8 @@ nix run . -- doctor
 
 ### Key Implementation Details
 
-- **`overrideVendorCargoPackage`** patches `libspa`/`pipewire` crate sources to fix bindgen macro omissions (`SPA_ID_INVALID` → `0xffffffff`, `PW_ID_ANY` → `0xffffffff`) when compiling against PipeWire 1.6.5 headers. These crates are only needed for test targets; production builds skip them via `doCheck = false` (drops `--all-targets`).
-- **`doCheck = false`** in `commonArgs` ensures `buildDepsOnly` doesn't compile dev-dependencies (test targets). The patch is retained for anyone adding a separate test derivation later.
+- Capture uses GStreamer's `pipewiresrc`; no Rust `pipewire`/`libspa` crates or vendored binding patches are needed. The ignored `test_gstreamer_pipewire_source` checks the actual capture plugin without opening a portal session.
+- **`doCheck = false`** keeps test targets out of the production Nix build. Run the Cargo test suite separately.
 - **`GST_PLUGIN_SYSTEM_PATH_1_0`** (not `GST_PLUGIN_SYSTEM_PATH`) is set in `wrapProgram`. nixpkgs' `gst-inspect-1.0` wrapper reads the version-specific `_1_0` variable and appends Nix profile paths to it — if we set the generic variant, it gets shadowed. Must use `gstreamer.out` (not plain `gstreamer`) in `gstRuntimePlugins` because the default output is `bin` (no plugin `.so` files); `out` has `libgstcoreelements.so` with `capsfilter`, `queue`, `fakesink`, etc. All 7 GStreamer packages (`gstreamer.out`, `gst-plugins-base`, `-good`, `-bad`, `-ugly`, `gst-libav`, `gst-vaapi`) are included. Every plugin element used by the pipeline (`appsrc`, `videoconvert`, `capsfilter`, `queue`, `mpegtsmux`, `udpsink`, codecs, parsers) must be covered.
 - **Crane's `overrideVendorCargoPackage`** is the correct mechanism for patching vendored dependency sources — `cargoPatches` (from nixpkgs' `buildRustPackage`) is not supported by crane.
 
