@@ -2166,12 +2166,14 @@ mod tests {
     #[test]
     fn selects_a_sink_advertised_mode_or_allows_missing_parameter() {
         let config = DaemonConfig::default();
-        let offered =
-            "38 00 01 04 00000080 00000000 00000000 00 0000 0000 1F none none";
+        let offered = "38 00 01 04 00000080 00000000 00000000 00 0000 0000 1F none none";
         let selected = select_negotiated_video_mode(Some(offered), &config)
             .expect("valid WFD capabilities")
             .expect("mode selected");
-        assert_eq!((selected.width, selected.height, selected.framerate), (1920, 1080, 30));
+        assert_eq!(
+            (selected.width, selected.height, selected.framerate),
+            (1920, 1080, 30)
+        );
         assert_eq!(selected.wfd_video_formats, offered);
 
         assert!(select_negotiated_video_mode(None, &config)
