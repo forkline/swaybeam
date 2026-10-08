@@ -477,7 +477,9 @@ async fn daemon_command(
         handle.await.ok();
     }
 
-    Ok(())
+    // Preserve the daemon's failure status after cleanup and JSON event drain,
+    // so supervisors and scripts do not mistake a failed session for success.
+    result
 }
 
 async fn status_command(json_output: bool) -> Result<()> {
