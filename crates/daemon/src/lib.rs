@@ -1840,23 +1840,16 @@ impl Daemon {
         let sink_caps = rtsp_client.send_get_parameter(params_to_request).await?;
         info!("Sink capabilities: {:?}", sink_caps);
 
-        // Drop any previous session's selection before choosing again: the
-        // fallback branch below must mean "no mode was selected", not "keep
-        // whatever the last sink agreed to".
+        // Drop any previous session's selection before choosing again.
         self.selected_video_mode = None;
 
-        // Commit to exactly one mode, and to one we can actually produce: the
-        // encoder is already configured for this geometry by the time we get
-        // here, so a selection the pipeline can't honour would just be a
-        // different way of lying to the sink.
-        let selected = sink_caps.get("wfd_video_formats").and_then(|formats| {
-            swaybeam_rtsp::WfdCapabilities::select_video_mode(
-                formats,
-                self.config.video_width,
-                self.config.video_height,
-                self.config.video_framerate,
-            )
-        });
+        // M4 commits to exactly one mode the sink advertised and we can
+        // produce. An advertised but incompatible mode must fail negotiation;
+        // it is not safe to announce a hard-coded default to that sink.
+        let selected = select_negotiated_video_mode(
+            sink_caps.get("wfd_video_formats").map(String::as_str),
+            &self.config,
+        )?;
 
         let selected_video_format = match selected {
             Some(mode) => {
@@ -1883,10 +1876,10 @@ impl Daemon {
                 formats
             }
             None => {
-                warn!(
-                    "Could not select a video mode from the sink's wfd_video_formats; \
-                     falling back to our own capability string, which the sink may not honour"
-                );
+                // Legacy interoperability path for sinks omitting video
+                // capabilities entirely. A present but incompatible offer
+                // was already rejected by select_negotiated_video_mode.
+                warn!("Sink omitted wfd_video_formats; using legacy source default");
                 swaybeam_rtsp::WfdCapabilities::build_video_formats()
             }
         };
@@ -2112,6 +2105,38 @@ impl Daemon {
     }
 }
 
+/// Select one H.264 WFD mode, or reject a sink's incompatible advertisement.
+///
+/// A missing parameter retains the legacy source-default path for sinks that
+/// omit it entirely; an explicit advertisement with no usable mode must not
+/// be replaced with an invented 1080p30 selection.
+fn select_negotiated_video_mode(
+    sink_formats: Option<&str>,
+    config: &DaemonConfig,
+) -> anyhow::Result<Option<swaybeam_rtsp::SelectedVideoMode>> {
+    let Some(formats) = sink_formats else {
+        return Ok(None);
+    };
+
+    let mode = swaybeam_rtsp::WfdCapabilities::select_video_mode(
+        formats,
+        config.video_width,
+        config.video_height,
+        config.video_framerate,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "Sink advertised wfd_video_formats with no compatible H.264 mode \
+             (source max {}x{}p{})",
+            config.video_width,
+            config.video_height,
+            config.video_framerate
+        )
+    })?;
+
+    Ok(Some(mode))
+}
+
 fn samsung_software_compatibility(name: &str) -> bool {
     name.trim()
         .eq_ignore_ascii_case("[TV] Samsung 8 Series (55)")
@@ -2119,6 +2144,41 @@ fn samsung_software_compatibility(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{select_negotiated_video_mode, DaemonConfig};
+
+    #[test]
+    fn rejects_incompatible_or_malformed_sink_video_advertisements() {
+        let config = DaemonConfig::default();
+        for formats in [
+            // Constrained-high only: the encoder emits constrained baseline.
+            "38 00 02 04 00000080 00000000 00000000 00 0000 0000 1F none none",
+            // Only 1080p30 advertised, but level 3.1 is insufficient.
+            "38 00 01 01 00000080 00000000 00000000 00 0000 0000 1F none none",
+            "garbage",
+        ] {
+            let error = select_negotiated_video_mode(Some(formats), &config)
+                .err()
+                .expect("unsupported advertisement must fail");
+            assert!(error.to_string().contains("no compatible H.264 mode"));
+        }
+    }
+
+    #[test]
+    fn selects_a_sink_advertised_mode_or_allows_missing_parameter() {
+        let config = DaemonConfig::default();
+        let offered =
+            "38 00 01 04 00000080 00000000 00000000 00 0000 0000 1F none none";
+        let selected = select_negotiated_video_mode(Some(offered), &config)
+            .expect("valid WFD capabilities")
+            .expect("mode selected");
+        assert_eq!((selected.width, selected.height, selected.framerate), (1920, 1080, 30));
+        assert_eq!(selected.wfd_video_formats, offered);
+
+        assert!(select_negotiated_video_mode(None, &config)
+            .expect("missing parameter uses legacy fallback")
+            .is_none());
+    }
+
     #[test]
     fn samsung_compatibility_is_scoped_to_observed_model() {
         assert!(super::samsung_software_compatibility(
