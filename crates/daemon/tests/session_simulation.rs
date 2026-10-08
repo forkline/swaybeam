@@ -104,11 +104,14 @@ mod session_simulation {
         assert_eq!(caps_h264.negotiate_video_codec(), NegotiatedCodec::H264);
         println!("✓ H.264 negotiation successful");
 
-        // Test H.265 for 4K
-        let mut caps_h265 = WfdCapabilities::new();
-        caps_h265.video_formats = Some("01 01 00 000000000000001F".to_string());
-        assert_eq!(caps_h265.negotiate_video_codec(), NegotiatedCodec::H265);
-        println!("✓ H.265 negotiation successful");
+        // Was asserted as H.265, from the old parser reading field 3 as a
+        // "codec mask" and testing bit 4. Field 3 is the H.264 level, and 4.2
+        // encodes as `10`. `wfd_video_formats` advertises H.264 only; HEVC is
+        // WFD 2.0's `wfd2_video_formats`, which is never requested.
+        let mut caps_level_42 = WfdCapabilities::new();
+        caps_level_42.video_formats = Some("01 01 00 000000000000001F".to_string());
+        assert_eq!(caps_level_42.negotiate_video_codec(), NegotiatedCodec::H264);
+        println!("✓ level-4.2 sink is not mistaken for HEVC");
 
         // Test fallback to H.264
         let mut caps_default = WfdCapabilities::new();

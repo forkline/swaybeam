@@ -176,11 +176,22 @@ mod tests {
         println!("Connected to session D-Bus with portal available");
     }
 
-    /// Test PipeWire initialization
+    /// Verify the GStreamer capture plugin used by the daemon is installed.
+    /// Construction stays in NULL state: no portal or PipeWire session is opened.
     #[test]
-    #[ignore = "Requires PipeWire"]
-    fn test_pipewire_init() {
-        pipewire::init();
-        println!("PipeWire initialized successfully");
+    #[ignore = "Requires the GStreamer PipeWire plugin"]
+    fn test_gstreamer_pipewire_source() {
+        use gstreamer::prelude::*;
+
+        gstreamer::init().expect("Failed to initialize GStreamer");
+        let source = gstreamer::ElementFactory::make("pipewiresrc")
+            .build()
+            .expect("The daemon requires the GStreamer pipewiresrc plugin");
+        let pad = source.static_pad("src").expect("Video source pad");
+        let video_caps = gstreamer::Caps::builder("video/x-raw").build();
+        assert!(
+            pad.query_caps(None).can_intersect(&video_caps),
+            "pipewiresrc must support raw video capture"
+        );
     }
 }

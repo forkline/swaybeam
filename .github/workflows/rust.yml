@@ -83,7 +83,27 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
             libpipewire-0.3-dev \
-            pkg-config
+            pkg-config \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-pipewire
+
+      # The -dev packages above carry headers, which is all the compile needs.
+      # The tests build real GStreamer pipelines, and an element only exists at
+      # runtime if its plugin is installed -- so the plugin packages are
+      # required here and only here. Without them
+      # reserved_sockets_send_rtp_and_rtcp_on_loopback fails with
+      # `no element "x264enc"`, which reads like a code fault but is a missing
+      # gstreamer1.0-plugins-ugly.
+      #
+      # Which package holds what, for the elements these tests instantiate:
+      #   base     videotestsrc, videoconvert, videoscale
+      #   good     udpsink, rtpbin, rtpmp2tpay, imagefreeze, pulsesrc
+      #   bad      mpegtsmux, h264parse, x265enc, svtav1enc, faac
+      #   ugly     x264enc
+      #   pipewire pipewiresrc
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -148,42 +168,20 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      - name: Extract crate information
-        run: |
-          echo "PROJECT_NAME=swaybeam" >> $GITHUB_ENV
-          echo "PROJECT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ./Cargo.toml | head -n1)" >> $GITHUB_ENV
-
-      - name: Make release
-        id: package
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          cargo build --release
-          tar -czf ${PROJECT_NAME}-${PROJECT_VERSION}-x86_64.tar.gz -C target/release swaybeam
-          echo "PKG_BASE_NAME=${PROJECT_NAME}-${PROJECT_VERSION}-x86_64" >> $GITHUB_OUTPUT
-
-      - name: Generate SHA256 hash
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          sha256sum ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz > ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
-          cat ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
-
-      - name: Get Changelog Entry
-        if: startsWith(github.ref, 'refs/tags/')
-        id: changelog_reader
-        uses: mindsers/changelog-reader-action@v2.4.0
-        with:
-          version: v${{ env.PROJECT_VERSION }}
-          path: ./CHANGELOG.md
-
-      - name: Publish Release
-        uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          body: ${{ steps.changelog_reader.outputs.changes }}
-          prerelease: ${{ steps.changelog_reader.outputs.status == 'prereleased' }}
-          draft: ${{ steps.changelog_reader.outputs.status == 'unreleased' }}
-          files: |
-            ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz
-            ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Release publishing used to live here and has moved to release.yml.
+      #
+      # It failed on the v0.5.0 tag with "Resource not accessible by
+      # integration" while trying to *update* an existing release -- because
+      # release.yml had already created it. Two workflows publishing the same
+      # release is the actual fault; granting this job contents:write would
+      # only have let them both write, and they disagreed about what to write:
+      #
+      #   - this job named assets from Cargo.toml (swaybeam-0.4.3-x86_64.tar.gz)
+      #     while the tag said v0.5.0, so a v0.5.0 release would have carried
+      #     0.4.3 archives
+      #   - release.yml names them from the tag and builds arm64 as well, which
+      #     this job never did
+      #
+      # So this job is now purely a compile check, and release.yml owns
+      # publishing. It still gates the release only loosely: the two run in
+      # parallel, as release.yml's header explains.

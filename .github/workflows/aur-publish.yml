@@ -17,11 +17,19 @@
 
 name: aur-publish
 
+# DISABLED ON THIS FORK -- manual dispatch only.
+#
+# This is upstream's machinery and it publishes upstream's packages: the
+# generator in .ci/generate-pkgbuild.sh writes PKGBUILDs naming `swaybeam`
+# and `swaybeam-bin`, with forkline URLs and upstream's maintainer line. Run
+# from this fork it would either fail on AUR_* secrets that are not set here,
+# or -- if they were -- push this fork's build over upstream's AUR packages.
+#
+# The fork's package is `swaybeam-hyprland-bin`, maintained separately and
+# installing the archives from release.yml. To wire it up here: add its
+# PKGBUILD to this repo, point the matrix at it, and set the AUR_* secrets.
 on:
-  workflow_run:
-    workflows: ["Rust"]
-    types:
-      - completed
+  workflow_dispatch:
 
 jobs:
   aur-publish:

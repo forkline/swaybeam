@@ -1,0 +1,161 @@
+# Release Workflow
+#
+# Builds swaybeam for amd64 and arm64 on tag push and attaches the archives
+# to a GitHub Release.
+#
+# Setup Requirements:
+# 1. No secrets required (GITHUB_TOKEN is auto-provided)
+# 2. Settings -> Actions -> General -> Workflow permissions must allow
+#    "Read and write permissions", or the release step cannot create the
+#    release. The `permissions:` block below requests it per-job.
+#
+# Workflow Triggers:
+# - Push of a tag matching v[0-9]*
+# - Manual dispatch, which builds and uploads artifacts but publishes no
+#   release, so the build can be exercised without tagging.
+#
+# Relationship to the other tag-triggered workflows:
+# - rust.yml already runs fmt, clippy, tests, docs and a build on v[0-9]*
+#   tags, so this workflow deliberately does not repeat them.
+# - It runs in PARALLEL with rust.yml rather than after it, so a tag whose
+#   tests fail will still publish binaries. That is a deliberate trade for a
+#   simple, predictable trigger; if it matters, gate this on rust.yml the way
+#   aur-publish.yml does, with `on: workflow_run`.
+# - aur-publish.yml chains off rust.yml completing and is unaffected by this.
+#
+# Notes on what these archives are, and are not:
+# - The binary is dynamically linked against GStreamer, PipeWire and glib.
+#   It is not self-contained: the runtime packages named in the README are
+#   still required on the target machine. This is not a static build because
+#   GStreamer loads its plugins as shared objects at runtime, so a static
+#   swaybeam would still need the plugin set present to do anything.
+# - Built on Ubuntu 24.04, so the binaries need glibc 2.39 or newer. They
+#   will not run on older distributions; those should build from source.
+# - arm64 builds on a native runner rather than cross-compiling. Cross would
+#   mean assembling an arm64 sysroot for the whole GStreamer and PipeWire
+#   stack, which is far more fragile than using the runner GitHub provides.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - v[0-9]*
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libglib2.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            libpipewire-0.3-dev \
+            pkg-config
+
+      - name: Install stable toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - run: rustup override set ${{steps.toolchain.outputs.name}}
+
+      # --locked so a release is built from the committed Cargo.lock rather
+      # than whatever resolves on the day.
+      - name: Build
+        run: cargo build --release --locked --bin swaybeam
+
+      - name: Package
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="$(git describe --tags --always --dirty)"
+          fi
+          name="swaybeam-${version}-linux-${{ matrix.arch }}"
+
+          strip target/release/swaybeam
+          mkdir -p "dist/${name}"
+          cp target/release/swaybeam "dist/${name}/"
+          cp LICENSE README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # gh is preinstalled on the runners, so this needs no third-party
+      # action for the one step that holds a write token.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$(mktemp)"
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "tar xzf swaybeam-${GITHUB_REF_NAME}-linux-\$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz"
+            echo "install -Dm755 swaybeam-*/swaybeam ~/.local/bin/swaybeam"
+            echo 'swaybeam doctor'
+            echo '```'
+            echo
+            echo "Or build from source:"
+            echo
+            echo '```bash'
+            echo "cargo install --git ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} --tag ${GITHUB_REF_NAME} swaybeam-cli --bin swaybeam --root ~/.local"
+            echo '```'
+            echo
+            echo "These binaries are dynamically linked and need the GStreamer,"
+            echo "PipeWire and portal packages listed in the README, plus glibc"
+            echo "2.39 or newer. Run \`swaybeam doctor\` to check the host."
+          } > "$notes"
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file "$notes" \
+            --verify-tag \
+            dist/*.tar.gz dist/*.sha256
