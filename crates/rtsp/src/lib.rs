@@ -221,8 +221,8 @@ impl WfdCapabilities {
         }
     }
 
-    /// The source's own `wfd_video_formats`, used when a sink advertises
-    /// nothing we can parse.
+    /// The source's own `wfd_video_formats`, used when a sink omits
+    /// its video capabilities entirely.
     ///
     /// This was `"01 01 00 0000000000000017"`, which is not a well-formed
     /// value at all -- four fields where the parameter takes thirteen. Nothing
@@ -242,8 +242,8 @@ impl WfdCapabilities {
     /// straight back -- which this used to do -- says "I might send any of
     /// these", leaving the sink to guess the geometry of what arrives.
     ///
-    /// Returns `None` when the sink advertises nothing we can produce, in
-    /// which case the caller should fall back rather than send a bogus M4.
+    /// Returns `None` when the sink advertises no mode we can produce.
+    /// A caller must reject that advertisement rather than send an invented M4.
     pub fn select_video_mode(
         sink_formats: &str,
         max_width: u32,
@@ -2717,7 +2717,7 @@ mod tests {
     }
 
     /// A sink whose only advertised level cannot carry any mode it lists is
-    /// self-contradictory; better to fall back than to echo the nonsense.
+    /// self-contradictory; better to reject than to echo the nonsense.
     #[test]
     fn selection_rejects_modes_no_advertised_level_can_carry() {
         let formats = "38 00 01 01 00000080 00000000 00000000 00 0000 0000 1F none none";
@@ -2756,7 +2756,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_falls_back_when_nothing_fits() {
+    fn selection_rejects_when_nothing_fits() {
         assert!(WfdCapabilities::select_video_mode(LG_SINK_FORMATS, 320, 240, 30).is_none());
         assert!(WfdCapabilities::select_video_mode("garbage", 1920, 1080, 30).is_none());
     }
