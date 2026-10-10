@@ -5,31 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v0.5.0](https://github.com/forkline/swaybeam/tree/v0.5.0) - 2026-10-10
 
 ### Fixed
 
-- Provide persistent Wi-Fi Direct PC identity configuration for automatic full-screen sharing on LG webOS, with an Arch Linux systemd service example.
-- Remove unused Rust PipeWire test bindings that broke workspace builds with current system headers; check the GStreamer capture plugin instead.
-- Keep square pixels when scaling captured video to the negotiated mode, preserving desktop proportions with borders instead of anamorphic video.
-- Use the system clock for PipeWire streaming so capture clock resets do not freeze video output.
-- Select software H.264 automatically for the observed Samsung 8 Series (55), while preserving explicit codec overrides.
-- Reserve and advertise the actual RTP/RTCP sockets for peer-initiated SETUP, and use GStreamer RTP session handling.
-- Avoid RTSP client connections to the local group-owner address and clarify pre-stream DHCP/RTSP failures.
-
-## [v0.4.3](https://github.com/forkline/swaybeam/tree/v0.4.3) - 2026-05-02
-
-### Fixed
-
-- external: Reuse disabled headless outputs instead of creating new ones ([5d3d763](https://github.com/forkline/swaybeam/commit/5d3d7637ca79f2c70d769064e358e1f3051c5f87))
-### Documentation
-
-- Add portal troubleshooting for WAYLAND_DISPLAY issue ([e59afbd](https://github.com/forkline/swaybeam/commit/e59afbda7db45d04e234f9b67dcc39cc377c26d4))
+- cli: Propagate daemon failures after cleanup (#107) ([4ce749d](https://github.com/forkline/swaybeam/commit/4ce749d71b392a30fee5108a7586b49d25b82265))
+- Pin pipewire and libspa to 0.9.2 to prevent version conflict (#30) ([daa0d06](https://github.com/forkline/swaybeam/commit/daa0d06c8e6da5b118eccc3d385852f358ec8041))
+- Reject unsupported WFD video modes during RTSP negotiation (#106) ([38bffdf](https://github.com/forkline/swaybeam/commit/38bffdf81d7c1b5499c780b953f825466d04ad50))
 ### Build
 
-- deps: Update dependency @opencode-ai/plugin to v1.4.6 (#5) ([4fafd3c](https://github.com/forkline/swaybeam/commit/4fafd3c52b53d741f2812351c9b9e3f21c1c3e2b))
-- deps: Update Rust crate ctr to 0.10 (#7) ([6284a76](https://github.com/forkline/swaybeam/commit/6284a76d4eb0f8da5d81757c32da60edb779da6a))
+- deps: Update actions/cache action to v5 (#20) ([b2ab254](https://github.com/forkline/swaybeam/commit/b2ab254e8b3a3b0eab700ba12a5dd5dc1fd9daa7))
+- deps: Update softprops/action-gh-release action to v3 (#18) ([21f7cfc](https://github.com/forkline/swaybeam/commit/21f7cfca4489144a516237dd6b489afa66718b0d))
+- deps: Update actions/checkout action to v6 (#21) ([3fdd5cc](https://github.com/forkline/swaybeam/commit/3fdd5cc0d730c358ccf7eb632ec4126feea075b8))
+- deps: Update clechasseur/rs-clippy-check action to v6 (#17) ([9ea076b](https://github.com/forkline/swaybeam/commit/9ea076b21522a4e93341add247d4882dbaf06b52))
+- deps: Update actions/setup-python action to v6 (#22) ([a98d2c0](https://github.com/forkline/swaybeam/commit/a98d2c07146b9329ef99baa7e5dff4a37e5cc47a))
+- deps: Update Rust crate zvariant to v5.11.0 (#23) ([99e3ef7](https://github.com/forkline/swaybeam/commit/99e3ef775b5848f87c97c34e80c871ce72b0c082))
+- deps: Update Rust crate tokio to v1.52.2 (#24) ([03590b6](https://github.com/forkline/swaybeam/commit/03590b6cb345149ee1d848cc5d8d709d8cb7078e))
+- deps: Update Rust crate tokio to v1.52.3 (#25) ([e58692d](https://github.com/forkline/swaybeam/commit/e58692da800385012bc552187d1ebf3528aa5b4f))
+- deps: Update clechasseur/rs-clippy-check action to v6.0.4 (#26) ([47f85c8](https://github.com/forkline/swaybeam/commit/47f85c8c26fd6071eab279e2e52357080757133e))
+- deps: Update gstreamer-rust monorepo to v0.25.2 (#27) ([bab128b](https://github.com/forkline/swaybeam/commit/bab128bc074016f74f792f270d91a80f7c71a9c6))
+- deps: Update mindsers/changelog-reader-action action to v2.3.0 (#32) ([3192463](https://github.com/forkline/swaybeam/commit/3192463e1dffafa0f8c0886b965a203885f7eb4c))
+- deps: Update mindsers/changelog-reader-action action to v2.4.0 (#33) ([f089a3f](https://github.com/forkline/swaybeam/commit/f089a3f92919a9733425af0fdf962dd422085bad))
+- deps: Update pipewire and libspa to v0.10 for compatibility (#31) ([cf7a62e](https://github.com/forkline/swaybeam/commit/cf7a62eb055ca11efe58c202a210aa949ae86756))
+- deps: Update Rust crate ctr to v0.10.1 (#34) ([87a2c22](https://github.com/forkline/swaybeam/commit/87a2c2231b70cf3371a468a059015e66fb459d6b))
+- deps: Update Rust crate serde_json to v1.0.150 (#36) ([6ba4a62](https://github.com/forkline/swaybeam/commit/6ba4a6277f3274682d96ffd89b0c9168e3105a04))
+- deps: Update Rust crate aes to v0.9.1 (#38) ([c23160a](https://github.com/forkline/swaybeam/commit/c23160a4ea12d2aed362ea252c42fc52cffbb89e))
+- deps: Update KSXGitHub/github-actions-deploy-aur action to v4.1.3 (#16) ([ea11a8e](https://github.com/forkline/swaybeam/commit/ea11a8e89b86f8f85f622a3f6d88208c0817efa8))
+- deps: Update Rust crate uuid to v1.23.2 (#39) ([fd93163](https://github.com/forkline/swaybeam/commit/fd931634c3732391ad90eb93ea80f111805fbf64))
+- deps: Update Rust crate zbus to v5.16.0 (#40) ([581b957](https://github.com/forkline/swaybeam/commit/581b957cd4c6cb4ac4d80700c4ea268df4cdd67a))
+- deps: Update Rust crate zvariant to v5.12.0 (#41) ([17463c0](https://github.com/forkline/swaybeam/commit/17463c01da3ba64882780e386b355ef829601fd0))
+- deps: Update Rust crate tabled to 0.21 (#42) ([71f1a94](https://github.com/forkline/swaybeam/commit/71f1a94aeb806290215f90fd9403c4ce13cf901b))
+- deps: Update Rust crate uuid to v1.23.3 (#43) ([dd9c6f2](https://github.com/forkline/swaybeam/commit/dd9c6f24c8b4b68145afbea01f94fc1e5b4a6937))
+- deps: Update actions/checkout action to v7 (#44) ([7af5cc2](https://github.com/forkline/swaybeam/commit/7af5cc2fbb857934f5a348f1e2833604394515a3))
+- deps: Update clechasseur/rs-clippy-check action to v6.0.5 (#46) ([924f77a](https://github.com/forkline/swaybeam/commit/924f77aa6c53867c0932fd63e49378baa5ea6ff9))
+- deps: Update Rust crate uuid to v1.23.4 (#47) ([4d46485](https://github.com/forkline/swaybeam/commit/4d46485b0aa44900b6063a341a71cfa154b53a50))
+- deps: Update Rust crate env_logger to v0.11.11 (#48) ([05dcda6](https://github.com/forkline/swaybeam/commit/05dcda67dcb3cd8ea1187c46bb9a5251b4e0e1b0))
+- deps: Update Rust crate anyhow to v1.0.103 (#49) ([90b3843](https://github.com/forkline/swaybeam/commit/90b38432415eba1b8fef8e9e16d1820477ca52c3))
+- deps: Update gstreamer-rust monorepo to v0.25.3 (#50) ([f1bad3b](https://github.com/forkline/swaybeam/commit/f1bad3bb03941ee916ec75012f99c43eb84465be))
+- deps: Update Rust crate zbus to v5.17.0 (#51) ([0113b60](https://github.com/forkline/swaybeam/commit/0113b6067e567ee0e1cf5302106c59c99849e25c))
+- deps: Update Rust crate zvariant to v5.13.0 (#52) ([27e09c6](https://github.com/forkline/swaybeam/commit/27e09c6228c8157d76a0ae058ddc01d4563c6079))
+- deps: Update Rust crate uuid to v1.23.5 (#53) ([dd8f7d9](https://github.com/forkline/swaybeam/commit/dd8f7d94dadddbe5688dc77d7662b51d8c8b95bb))
+- deps: Update KSXGitHub/github-actions-deploy-aur action to v4.2.0 (#55) ([2f8b336](https://github.com/forkline/swaybeam/commit/2f8b3365eccb58f56c7b3dbc1de5514f6e2f630c))
+- deps: Update actions/cache action to v6 (#45) ([3f69f64](https://github.com/forkline/swaybeam/commit/3f69f649d6d301bf3799e3ab14699eb20dcb1926))
+- deps: Update Rust crate clap to v4.6.2 (#56) ([6a8e44a](https://github.com/forkline/swaybeam/commit/6a8e44aca97bcd4ea18dc29cfd8530b8e5d6e6ac))
+- deps: Update Rust crate uuid to v1.24.0 (#57) ([189eab1](https://github.com/forkline/swaybeam/commit/189eab14f0a63a5d96c3a5cf624907128ef41518))
+- deps: Update Rust crate tokio to v1.52.4 (#58) ([f3bee6c](https://github.com/forkline/swaybeam/commit/f3bee6c13582e5fac16c8f7117dee1a010e10014))
+- deps: Update Rust crate tokio to v1.53.0 (#59) ([8ca5a59](https://github.com/forkline/swaybeam/commit/8ca5a59149a3a245fbaf3e8daad7d3e182df3d30))
+- deps: Update Rust crate zvariant to v5.13.1 (#60) ([55e6cac](https://github.com/forkline/swaybeam/commit/55e6caccbad051099f6a85ac0cc46da499d8d9ff))
+- deps: Update Rust crate zbus to v5.18.0 (#61) ([a73ded4](https://github.com/forkline/swaybeam/commit/a73ded4501d085d5a0505633ebb7d767af5aed9c))
+- deps: Update Rust crate futures-util to v0.3.33 (#62) ([6791d6e](https://github.com/forkline/swaybeam/commit/6791d6e885a013eba2ff986647240accfc06e25c))
+- deps: Update Rust crate anyhow to v1.0.104 (#63) ([f3e6881](https://github.com/forkline/swaybeam/commit/f3e688141b9f9c5858ff8619780fb61a9fa03bb2))
+- deps: Update Rust crate serde to v1.0.229 (#64) ([bfe05bb](https://github.com/forkline/swaybeam/commit/bfe05bb1d9c79a36811dc9766439ce9766d8f0e5))
+- deps: Update Rust crate thiserror to v2.0.19 (#65) ([503b6b8](https://github.com/forkline/swaybeam/commit/503b6b8b88c04eb91bf4b7816d93109c1533d400))
+- deps: Update Rust crate serde_json to v1.0.151 (#67) ([d915da1](https://github.com/forkline/swaybeam/commit/d915da186900a8c275949533ce832767975cfbc7))
+- deps: Update Rust crate libc to v0.2.187 (#69) ([e0018a6](https://github.com/forkline/swaybeam/commit/e0018a63226f9b8710a7ded70ec18b80d91ab413))
+- deps: Update Rust crate clap to v4.6.3 (#68) ([ec89bca](https://github.com/forkline/swaybeam/commit/ec89bca9e76da4e738394699725517d69a3b56f0))
+- deps: Update Rust crate tokio to v1.53.1 (#70) ([be545a4](https://github.com/forkline/swaybeam/commit/be545a4307c0d1076e5b67be8c328f5e5cb590d0))
+- deps: Update Rust crate libc to v0.2.188 (#71) ([239cb9e](https://github.com/forkline/swaybeam/commit/239cb9ee4a905d248d3c7454e533e77cbffb9079))
+- deps: Update Rust crate tokio-util to v0.7.19 (#72) ([fe69034](https://github.com/forkline/swaybeam/commit/fe69034020ded0f1698cf956b25376bb7c404232))
+- deps: Update Rust crate libc to v0.2.189 (#73) ([f1cae02](https://github.com/forkline/swaybeam/commit/f1cae027f5006f342f34230b03345dc986c9adee))
+- deps: Update Rust crate tokio-stream to v0.1.19 (#74) ([56fed52](https://github.com/forkline/swaybeam/commit/56fed52bda8396114d1077decc4344e7a6c2c6cb))
+- deps: Update actions/setup-python action to v7 (#66) ([3cd4292](https://github.com/forkline/swaybeam/commit/3cd42920bd28e6c3baa062fc870933666377b2aa))
+- deps: Update clechasseur/rs-clippy-check action to v6.0.6 (#75) ([031869b](https://github.com/forkline/swaybeam/commit/031869bb2042f6783d65830b96b3d5908ab251ab))
+- deps: Update Rust crate aes to v0.9.2 (#76) ([41a0cd3](https://github.com/forkline/swaybeam/commit/41a0cd359759b3bb93c86b60941a2af70ecbf46c))
+- deps: Update Rust crate thiserror to v2.0.20 (#78) ([ea6cdd6](https://github.com/forkline/swaybeam/commit/ea6cdd6775949f4b8f9e087e6f72abe58260945f))
+- deps: Update Rust crate zvariant to v5.14.0 (#80) ([5f56bd9](https://github.com/forkline/swaybeam/commit/5f56bd985f85cb2385956b953b203bf8d6f14469))
+- deps: Update Rust crate zbus to v5.19.0 (#79) ([1cf4029](https://github.com/forkline/swaybeam/commit/1cf40296bd3b675ebdd80dccf9c6f709f8fe09a7))
+- deps: Update Rust crate futures-util to v0.3.34 (#81) ([1bdbedb](https://github.com/forkline/swaybeam/commit/1bdbedb08283450e6ecea3626153411150dd9483))
+- deps: Update clechasseur/rs-clippy-check action to v6.0.7 (#82) ([9f585e1](https://github.com/forkline/swaybeam/commit/9f585e1df9305a06c00fbce57de9c335a82d7621))
+- deps: Update Rust crate uuid to v1.24.1 (#83) ([1ff2628](https://github.com/forkline/swaybeam/commit/1ff2628f5931198142f34f4435fda0ecfd1e245a))
+- deps: Update actions/stale action to v11 (#77) ([13d7684](https://github.com/forkline/swaybeam/commit/13d76846fa3244bd2c44c7fcdbc6ae0d979b3221))
+- deps: Update pipewire-libspa to v0.10.1 (#85) ([61510dd](https://github.com/forkline/swaybeam/commit/61510dd2efb914a0f287b23fa6d3eaddaaad46f2))
+- deps: Update Rust crate zvariant to v5.15.0 (#84) ([72a5558](https://github.com/forkline/swaybeam/commit/72a5558f3f6e6184c8b7f167f3f5cca879a70c83))
+- deps: Update Rust crate uuid to v1.25.0 (#86) ([44ba654](https://github.com/forkline/swaybeam/commit/44ba65418065c0504e1a0e84be32f931ba4283f5))
+- deps: Update Rust crate uuid to v1.26.0 (#87) ([c4abcb2](https://github.com/forkline/swaybeam/commit/c4abcb21320ca3d88fe1dd63a00b1b620f6fcecf))
+- deps: Update Rust crate aes to v0.9.3 (#88) ([a0177cb](https://github.com/forkline/swaybeam/commit/a0177cbc7cf0db22fbde5a0ca9301bf5a2b92f80))
+- deps: Update Rust crate uuid to v1.26.1 (#91) ([e34d75c](https://github.com/forkline/swaybeam/commit/e34d75ce9b32915a2679e40eca1edbd4dce2cb77))
+- deps: Update clechasseur/rs-clippy-check action to v6.1.0 (#92) ([e27ddf3](https://github.com/forkline/swaybeam/commit/e27ddf30b6b864463d2a26ccd6efc3805aac6c23))
+- deps: Update gstreamer-rust monorepo to v0.25.4 (#93) ([f919eeb](https://github.com/forkline/swaybeam/commit/f919eebd17c6c746c8ca710dc9387884c4d57959))
+- deps: Update Rust crate thiserror to v2.0.21 (#94) ([5778aa7](https://github.com/forkline/swaybeam/commit/5778aa728988de69fa8459c8957d41f8d5bbda2d))
+- deps: Update Rust crate libc to v0.2.190 (#95) ([edfaec8](https://github.com/forkline/swaybeam/commit/edfaec8781c714f58df1a2ee1a9016ff16e57d81))
+- deps: Update Rust crate uuid to v1.27.0 (#96) ([e4dbe74](https://github.com/forkline/swaybeam/commit/e4dbe746ae2a4c283360a4776f02e633930023e1))
+- deps: Update Rust crate tokio to v1.53.2 (#97) ([70649eb](https://github.com/forkline/swaybeam/commit/70649eb6545269c9a424f6a84d3cbc24dfc44c69))
+- deps: Update Rust crate tabled to 0.22 (#89) ([4b0fc6b](https://github.com/forkline/swaybeam/commit/4b0fc6bcb889b43de9835323949c523c0586aa50))
+- deps: Update Rust crate gio to v0.22.10 (#98) ([5fd0018](https://github.com/forkline/swaybeam/commit/5fd00187e51132e20bff19c06d7e99681c7a7161))
+- deps: Update GitHub Artifact Actions (#99) ([70012f8](https://github.com/forkline/swaybeam/commit/70012f8cc2035eef2c9745e4f91e755e1994afda))
+- deps: Update Rust crate tokio-util to v0.7.20 (#108) ([061da1c](https://github.com/forkline/swaybeam/commit/061da1c08b1e3c85fbfb4906602041c7110d129e))
+- deps: Update Rust crate uuid to v1.28.0 (#109) ([7e8673b](https://github.com/forkline/swaybeam/commit/7e8673b4b1667cf1feec49da855f63dece3df807))
 ### Chore
 
-- deps: Track Cargo.lock and update all dependencies ([5dabaf8](https://github.com/forkline/swaybeam/commit/5dabaf834a1fbbeb80af92cab0da4a4f67473c42))
-- Upgrade dependencies (zbus 5, zvariant 5, tabled 0.20) ([91687f3](https://github.com/forkline/swaybeam/commit/91687f358a01faca90c618f9688406b886323694))
+- Improve release script and update release skill (#35) ([a5ca9b6](https://github.com/forkline/swaybeam/commit/a5ca9b631d2850096255f7def8bff0ded85140ee))
