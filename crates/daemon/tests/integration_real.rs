@@ -158,21 +158,24 @@ mod tests {
     }
 
     /// Test NetworkManager D-Bus connection
-    #[test]
+    #[tokio::test]
     #[ignore = "Requires NetworkManager"]
-    fn test_networkmanager_dbus() {
+    async fn test_networkmanager_dbus() {
         // Just test we can connect to system bus
-        let _conn = zbus::blocking::Connection::system().expect("Failed to connect to system bus");
+        let _conn = zbus::Connection::system()
+            .await
+            .expect("Failed to connect to system bus");
         println!("Connected to system D-Bus");
     }
 
     /// Test xdg-desktop-portal D-Bus connection
-    #[test]
+    #[tokio::test]
     #[ignore = "Requires xdg-desktop-portal"]
-    fn test_portal_dbus() {
+    async fn test_portal_dbus() {
         // Just test we can connect to session bus
-        let _conn =
-            zbus::blocking::Connection::session().expect("Failed to connect to session bus");
+        let _conn = zbus::Connection::session()
+            .await
+            .expect("Failed to connect to session bus");
         println!("Connected to session D-Bus with portal available");
     }
 
