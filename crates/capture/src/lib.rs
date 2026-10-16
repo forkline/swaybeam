@@ -181,7 +181,10 @@ impl Capture {
 
         let mut opts: HashMap<&str, Variant<'_>> = HashMap::new();
         opts.insert("handle_token", Variant::from(create_req_token.as_str()));
-        opts.insert("session_handle_token", Variant::from(session_token.as_str()));
+        opts.insert(
+            "session_handle_token",
+            Variant::from(session_token.as_str()),
+        );
 
         let create_signal = subscribe_response(&conn, &create_response_path).await?;
         let _create_handle: zbus::OwnedObjectPath = screen_cast_proxy
@@ -378,12 +381,10 @@ impl PortalResponseWaiter {
         .map_err(|_| CaptureError::PortalError("Timeout waiting for portal response".into()))?
         .ok_or_else(|| CaptureError::PortalError("No Response signal received".into()))?;
 
-        let (response_code, results): (
-            u32,
-            std::collections::HashMap<String, zbus::OwnedVariant>,
-        ) = msg.body().deserialize().map_err(|e| {
-            CaptureError::PortalError(format!("Failed to parse Response signal: {}", e))
-        })?;
+        let (response_code, results): (u32, std::collections::HashMap<String, zbus::OwnedVariant>) =
+            msg.body().deserialize().map_err(|e| {
+                CaptureError::PortalError(format!("Failed to parse Response signal: {}", e))
+            })?;
 
         match response_code {
             0 => Ok(results),

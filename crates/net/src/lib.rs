@@ -496,8 +496,8 @@ impl P2pManager {
             sink.address
         );
 
-        let device_obj_path = zbus::ObjectPath::try_from(device_path.as_str())
-            .map_err(NetError::ZVariantError)?;
+        let device_obj_path =
+            zbus::ObjectPath::try_from(device_path.as_str()).map_err(NetError::ZVariantError)?;
         let peer_obj_path = sink
             .peer_path
             .as_ref()
@@ -528,10 +528,7 @@ impl P2pManager {
         // negotiation went the other way.
         let build_config = |ipv4_method: &'static str| {
             let mut ipv4_props: HashMap<&str, zbus::Variant<'_>> = HashMap::new();
-            ipv4_props.insert(
-                "method",
-                zbus::Variant::Str(zbus::Str::from(ipv4_method)),
-            );
+            ipv4_props.insert("method", zbus::Variant::Str(zbus::Str::from(ipv4_method)));
             ipv4_props.insert("never-default", zbus::Variant::Bool(true));
 
             // As group owner, take the address Wi-Fi Direct conventionally
@@ -557,10 +554,7 @@ impl P2pManager {
             ipv6_props.insert("may-fail", zbus::Variant::Bool(true));
 
             let mut connection_props: HashMap<&str, zbus::Variant<'_>> = HashMap::new();
-            connection_props.insert(
-                "type",
-                zbus::Variant::Str(zbus::Str::from("wifi-p2p")),
-            );
+            connection_props.insert("type", zbus::Variant::Str(zbus::Str::from("wifi-p2p")));
             connection_props.insert(
                 "id",
                 zbus::Variant::Str(zbus::Str::from(&self.config.group_name)),
@@ -568,14 +562,8 @@ impl P2pManager {
             connection_props.insert("autoconnect", zbus::Variant::Bool(false));
 
             let mut wifi_p2p_props: HashMap<&str, zbus::Variant<'_>> = HashMap::new();
-            wifi_p2p_props.insert(
-                "peer",
-                zbus::Variant::Str(zbus::Str::from(&sink.address)),
-            );
-            wifi_p2p_props.insert(
-                "wfd-ies",
-                zbus::Variant::Array(zbus::Array::from(&wfd_ies)),
-            );
+            wifi_p2p_props.insert("peer", zbus::Variant::Str(zbus::Str::from(&sink.address)));
+            wifi_p2p_props.insert("wfd-ies", zbus::Variant::Array(zbus::Array::from(&wfd_ies)));
 
             HashMap::from([
                 ("connection", connection_props),
@@ -593,10 +581,7 @@ impl P2pManager {
                 "bind-activation",
                 zbus::Variant::Str(zbus::Str::from("dbus-client")),
             ),
-            (
-                "persist",
-                zbus::Variant::Str(zbus::Str::from("volatile")),
-            ),
+            ("persist", zbus::Variant::Str(zbus::Str::from("volatile"))),
         ]);
 
         tracing::debug!("Connection config: {:?}", connection_config);
@@ -961,7 +946,8 @@ impl P2pManager {
             if let Ok(ip4_config_path) = device_proxy.ip4_config().await {
                 if ip4_config_path.as_str() != "/" {
                     let ip4_config = IP4ConfigProxy::builder(&self.connection)
-                        .path(ip4_config_path)                        .build()
+                        .path(ip4_config_path)
+                        .build()
                         .await
                         .map_err(|e| {
                             NetError::NetworkManagerError(format!(
@@ -1006,7 +992,8 @@ impl P2pManager {
             {
                 if ip4_config_path.as_str() != "/" {
                     let ip4_config = IP4ConfigProxy::builder(&self.connection)
-                        .path(ip4_config_path)                        .build()
+                        .path(ip4_config_path)
+                        .build()
                         .await?;
 
                     if let Ok(addresses) = ip4_config.addresses().await {
