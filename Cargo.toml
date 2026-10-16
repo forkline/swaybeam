@@ -27,7 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
-zbus = { version = "5", features = ["tokio"] }
+zbus = { version = "6", features = ["tokio"] }
 rand = "0.8"
 parking_lot = "0.12"
 
