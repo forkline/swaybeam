@@ -144,7 +144,7 @@ impl Capture {
     async fn start_real_portal_capture(&mut self) -> Result<PipeWireStream, CaptureError> {
         use std::collections::HashMap;
         use std::os::fd::AsRawFd;
-        use zvariant::Value;
+        use zbus::Variant;
 
         let conn = zbus::Connection::session().await.map_err(|e| {
             CaptureError::DBusError(format!("Failed to connect to session bus: {}", e))
@@ -179,12 +179,15 @@ impl Capture {
             sender_token, create_req_token
         );
 
-        let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
-        opts.insert("handle_token", Value::from(create_req_token.as_str()));
-        opts.insert("session_handle_token", Value::from(session_token.as_str()));
+        let mut opts: HashMap<&str, Variant<'_>> = HashMap::new();
+        opts.insert("handle_token", Variant::from(create_req_token.as_str()));
+        opts.insert(
+            "session_handle_token",
+            Variant::from(session_token.as_str()),
+        );
 
         let create_signal = subscribe_response(&conn, &create_response_path).await?;
-        let _create_handle: zvariant::OwnedObjectPath = screen_cast_proxy
+        let _create_handle: zbus::OwnedObjectPath = screen_cast_proxy
             .call("CreateSession", &(opts,))
             .await
             .map_err(|e| CaptureError::PortalError(format!("CreateSession failed: {}", e)))?;
@@ -201,7 +204,7 @@ impl Capture {
             })?
             .clone();
 
-        let session_handle: zvariant::ObjectPath<'_> =
+        let session_handle: zbus::ObjectPath<'_> =
             session_handle_str.as_str().try_into().map_err(|e| {
                 CaptureError::PortalError(format!("Invalid session handle path: {}", e))
             })?;
@@ -214,13 +217,13 @@ impl Capture {
             "/org/freedesktop/portal/desktop/request/{}/{}",
             sender_token, sel_req_token
         );
-        let mut sel_opts: HashMap<&str, Value<'_>> = HashMap::new();
-        sel_opts.insert("handle_token", Value::from(sel_req_token.as_str()));
-        sel_opts.insert("types", Value::from(1u32));
-        sel_opts.insert("multiple", Value::from(false));
+        let mut sel_opts: HashMap<&str, Variant<'_>> = HashMap::new();
+        sel_opts.insert("handle_token", Variant::from(sel_req_token.as_str()));
+        sel_opts.insert("types", Variant::from(1u32));
+        sel_opts.insert("multiple", Variant::from(false));
         sel_opts.insert(
             "cursor_mode",
-            Value::from(if self.config.cursor_visible {
+            Variant::from(if self.config.cursor_visible {
                 2u32
             } else {
                 1u32
@@ -228,7 +231,7 @@ impl Capture {
         );
 
         let sel_signal = subscribe_response(&conn, &sel_response_path).await?;
-        let _sel_handle: zvariant::OwnedObjectPath = screen_cast_proxy
+        let _sel_handle: zbus::OwnedObjectPath = screen_cast_proxy
             .call("SelectSources", &(session_handle.clone(), sel_opts))
             .await
             .map_err(|e| CaptureError::PortalError(format!("SelectSources failed: {}", e)))?;
@@ -241,11 +244,11 @@ impl Capture {
             "/org/freedesktop/portal/desktop/request/{}/{}",
             sender_token, start_req_token
         );
-        let mut start_opts: HashMap<&str, Value<'_>> = HashMap::new();
-        start_opts.insert("handle_token", Value::from(start_req_token.as_str()));
+        let mut start_opts: HashMap<&str, Variant<'_>> = HashMap::new();
+        start_opts.insert("handle_token", Variant::from(start_req_token.as_str()));
 
         let start_signal = subscribe_response(&conn, &start_response_path).await?;
-        let _start_handle: zvariant::OwnedObjectPath = screen_cast_proxy
+        let _start_handle: zbus::OwnedObjectPath = screen_cast_proxy
             .call("Start", &(session_handle.clone(), "", start_opts))
             .await
             .map_err(|e| CaptureError::PortalError(format!("Start failed: {}", e)))?;
@@ -256,14 +259,14 @@ impl Capture {
             .get("streams")
             .ok_or_else(|| CaptureError::PortalError("No streams in Start response".into()))?;
 
-        let streams: Vec<(u32, std::collections::HashMap<String, zvariant::OwnedValue>)> =
+        let streams: Vec<(u32, std::collections::HashMap<String, zbus::OwnedVariant>)> =
             streams_value
-                .downcast_ref::<zvariant::Array>()
+                .downcast_ref::<zbus::Array>()
                 .map_err(|e| {
                     CaptureError::PortalError(format!("Failed to deserialize streams array: {}", e))
                 })?
                 .try_into()
-                .map_err(|e: zvariant::Error| {
+                .map_err(|e: zbus::Error| {
                     CaptureError::PortalError(format!("Failed to parse streams entries: {}", e))
                 })?;
 
@@ -275,8 +278,8 @@ impl Capture {
         info!("Got PipeWire node_id: {}, props: {:?}", node_id, props);
 
         // Step 4: OpenPipeWireRemote
-        let pw_opts: HashMap<&str, Value<'_>> = HashMap::new();
-        let pw_fd: zvariant::OwnedFd = screen_cast_proxy
+        let pw_opts: HashMap<&str, Variant<'_>> = HashMap::new();
+        let pw_fd: zbus::OwnedFd = screen_cast_proxy
             .call("OpenPipeWireRemote", &(session_handle, pw_opts))
             .await
             .map_err(|e| CaptureError::PortalError(format!("OpenPipeWireRemote failed: {}", e)))?;
@@ -367,7 +370,7 @@ struct PortalResponseWaiter {
 impl PortalResponseWaiter {
     async fn await_response(
         mut self,
-    ) -> Result<std::collections::HashMap<String, zvariant::OwnedValue>, CaptureError> {
+    ) -> Result<std::collections::HashMap<String, zbus::OwnedVariant>, CaptureError> {
         use futures_util::StreamExt;
 
         let msg = tokio::time::timeout(
@@ -378,12 +381,10 @@ impl PortalResponseWaiter {
         .map_err(|_| CaptureError::PortalError("Timeout waiting for portal response".into()))?
         .ok_or_else(|| CaptureError::PortalError("No Response signal received".into()))?;
 
-        let (response_code, results): (
-            u32,
-            std::collections::HashMap<String, zvariant::OwnedValue>,
-        ) = msg.body().deserialize().map_err(|e| {
-            CaptureError::PortalError(format!("Failed to parse Response signal: {}", e))
-        })?;
+        let (response_code, results): (u32, std::collections::HashMap<String, zbus::OwnedVariant>) =
+            msg.body().deserialize().map_err(|e| {
+                CaptureError::PortalError(format!("Failed to parse Response signal: {}", e))
+            })?;
 
         match response_code {
             0 => Ok(results),
