@@ -29,7 +29,7 @@ thiserror = "2"
 anyhow = "1"
 zbus = { version = "5", features = ["tokio"] }
 rand = "0.8"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # GStreamer
 gstreamer = "0.25"
