@@ -26,3 +26,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 zbus.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
