@@ -6,7 +6,7 @@ use swaybeam_external::{ExternalResolution, VirtualOutput};
 
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock as PlRwLock;
 use rand::{rngs::OsRng, RngCore};
 use rsa::{BoxedUint, PublicKey};
@@ -1126,8 +1126,8 @@ impl Daemon {
         let n_bits = (cert.modulus.len() * 8) as u32;
         let e_bits = (cert.exponent.len() * 8) as u32;
         let public_key = match PublicKey::new(
-            BoxedUint::from_be_slice(&cert.modulus, n_bits).map_err(|e| anyhow::anyhow!(e))?,
-            BoxedUint::from_be_slice(&cert.exponent, e_bits).map_err(|e| anyhow::anyhow!(e))?,
+            BoxedUint::from_be_slice(&cert.modulus, n_bits).ok()?,
+            BoxedUint::from_be_slice(&cert.exponent, e_bits).ok()?,
         ) {
             Ok(key) => key,
             Err(err) => {
