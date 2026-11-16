@@ -6,7 +6,7 @@ use swaybeam_external::{ExternalResolution, VirtualOutput};
 
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock as PlRwLock;
 use rand::{rngs::OsRng, RngCore};
 use rsa::{BoxedUint, PublicKey};
@@ -1123,10 +1123,11 @@ impl Daemon {
         hdcp_stream: &TcpStream,
         cert: &HdcpReceiverCert,
     ) -> Option<[u8; 16]> {
-        let public_key = match PublicKey::new(
-            BoxedUint::from_be_slice(&cert.modulus),
-            BoxedUint::from_be_slice(&cert.exponent),
-        ) {
+        let n =
+            BoxedUint::from_be_slice(&cert.modulus, (cert.modulus.len() * 8) as u32).ok()?;
+        let e =
+            BoxedUint::from_be_slice(&cert.exponent, (cert.exponent.len() * 8) as u32).ok()?;
+        let public_key = match PublicKey::new(n, e) {
             Ok(key) => key,
             Err(err) => {
                 tracing::warn!("Failed to build HDCP receiver public key: {}", err);
