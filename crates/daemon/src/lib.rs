@@ -6,10 +6,10 @@ use swaybeam_external::{ExternalResolution, VirtualOutput};
 
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock as PlRwLock;
 use rand::{rngs::OsRng, RngCore};
-use rsa::{BigUint, Oaep, RsaPublicKey};
+use rsa::{BoxedUint, PublicKey};
 use sha1::Sha1;
 use sha2::Sha256;
 use tokio::net::{TcpSocket, TcpStream};
@@ -1123,9 +1123,11 @@ impl Daemon {
         hdcp_stream: &TcpStream,
         cert: &HdcpReceiverCert,
     ) -> Option<[u8; 16]> {
-        let public_key = match RsaPublicKey::new(
-            BigUint::from_bytes_be(&cert.modulus),
-            BigUint::from_bytes_be(&cert.exponent),
+        let n_bits = (cert.modulus.len() * 8) as u32;
+        let e_bits = (cert.exponent.len() * 8) as u32;
+        let public_key = match PublicKey::new(
+            BoxedUint::from_be_slice(&cert.modulus, n_bits).ok()?,
+            BoxedUint::from_be_slice(&cert.exponent, e_bits).ok()?,
         ) {
             Ok(key) => key,
             Err(err) => {
@@ -1136,7 +1138,7 @@ impl Daemon {
 
         let mut km = [0u8; 16];
         OsRng.fill_bytes(&mut km);
-        let ekpub_km = match public_key.encrypt(&mut OsRng, Oaep::new::<Sha1>(), &km) {
+        let ekpub_km = match public_key.oaep_encrypt::<Sha1>(&km) {
             Ok(ciphertext) => ciphertext,
             Err(err) => {
                 tracing::warn!(
